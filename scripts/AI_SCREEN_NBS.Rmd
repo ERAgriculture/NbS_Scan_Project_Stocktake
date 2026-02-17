@@ -1,0 +1,463 @@
+---
+title: "screen NBS"
+output: html_document
+date: "2026-01-26"
+---
+
+```{r}
+# ============================================================
+# CHUNK 1 — AI screening (merge ALL OpenAlex CSVs + dedupe + screen)
+#   - Robust merge (forces consistent column types to avoid bind_rows errors)
+#   - Reports duplicate DOIs before dedupe
+#   - Dedupe uses doi_key first, then openalex_id, else row fallback
+# ============================================================
+
+# ---------- Packages ----------
+req_pkgs <- c(
+  "AIscreenR", "dplyr", "readr", "stringr", "tibble", "tidyr",
+  "purrr", "future", "furrr"
+)
+to_install <- req_pkgs[!vapply(req_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(to_install) > 0) install.packages(to_install)
+
+library(AIscreenR)
+library(dplyr)
+library(readr)
+library(stringr)
+library(tibble)
+library(tidyr)
+library(purrr)
+library(future)
+library(furrr)
+
+# ---------- API key ----------
+api_key <- Sys.getenv("OPENAI_API_KEY")
+if (is.na(api_key) || api_key == "") {
+  stop("OPENAI_API_KEY is not set. Add it to ~/.Renviron or set in your session.")
+}
+set_api_key(api_key)
+
+# ---------- EDIT PATHS ----------
+openalex_dir <- "C:/Users/mlolita/OneDrive - CGIAR/Alliance - ClimateActionNetZero - 1_Projects/D591_Rural-Scan_NBS/2_Technical_&_Data/Stocktake Review/Open Alex search/outputs_with_abstracts"
+
+# ---------- Model / parallel ----------
+model_name <- "gpt-4o-mini"
+reps_n <- 1
+n_workers <- 4
+
+# ---------- Read + merge ALL OpenAlex CSVs (robust to type mismatches) ----------
+openalex_files <- list.files(openalex_dir, pattern = "\\.csv$", full.names = TRUE)
+if (length(openalex_files) == 0) stop(paste0("No CSV files found in: ", openalex_dir))
+
+read_openalex_one <- function(fp) {
+  readr::read_csv(
+    fp,
+    show_col_types = FALSE,
+    col_types = readr::cols(.default = readr::col_character())
+  ) %>%
+    mutate(source_file = basename(fp))
+}
+
+infile_all <- purrr::map_dfr(openalex_files, read_openalex_one)
+
+message("OpenAlex files read: ", length(openalex_files))
+message("Total rows (raw, all files): ", nrow(infile_all))
+
+# Optional: parse a few numeric columns AFTER merge (safe; ignores non-numeric junk)
+num_cols <- intersect(
+  c("publication_year","rank","cited_by_count","relevance_score",
+    "journal_impact_factor","citations_per_year","priority_score"),
+  names(infile_all)
+)
+if (length(num_cols) > 0) {
+  infile_all <- infile_all %>%
+    mutate(across(all_of(num_cols), ~ readr::parse_number(.x)))
+}
+
+# ---------- Keep ONLY rows with abstracts ----------
+dat_with_abs <- infile_all %>%
+  mutate(
+    abstract_crossref = as.character(abstract_crossref),
+    has_abstract = !is.na(abstract_crossref) & abstract_crossref != ""
+  ) %>%
+  filter(has_abstract)
+
+message("Rows with abstracts: ", nrow(dat_with_abs))
+
+# ---------- Create DOI key for duplicate reporting + dedupe ----------
+# NOTE: You want DOI-only matching later; here we only do light cleaning to count/dedupe.
+dat_with_abs <- dat_with_abs %>%
+  mutate(
+    doi = as.character(doi),
+    doi_key = str_to_lower(str_trim(doi))
+  )
+
+# ---------- Duplicate DOI reporting (pre-dedupe) ----------
+dup_tbl <- dat_with_abs %>%
+  filter(!is.na(doi_key) & doi_key != "") %>%
+  count(doi_key, name = "n") %>%
+  filter(n > 1)
+
+n_dup_keys <- nrow(dup_tbl)
+n_dup_rows <- if (n_dup_keys == 0) 0 else (sum(dup_tbl$n) - n_dup_keys)
+
+message("Duplicate DOI keys (n > 1): ", n_dup_keys)
+message("Duplicate rows beyond first (sum(n)-nkeys): ", n_dup_rows)
+
+# ---------- Build screening table + DEDUPE ----------
+dat <- dat_with_abs %>%
+  mutate(
+    openalex_id_chr = as.character(openalex_id),
+
+    # dedupe key: doi_key first, then openalex_id, else unique row fallback
+    dedupe_key = dplyr::case_when(
+      !is.na(doi_key) & doi_key != "" ~ paste0("doi:", doi_key),
+      !is.na(openalex_id_chr) & openalex_id_chr != "" ~ paste0("oa:", openalex_id_chr),
+      TRUE ~ paste0("row:", source_file, "_", dplyr::row_number())
+    ),
+
+    # stable screening id (used by AIscreenR)
+    screen_id = dplyr::coalesce(
+      openalex_id_chr,
+      doi,
+      paste0(source_file, "_row_", dplyr::row_number())
+    ),
+
+    title = as.character(title),
+    abstract_for_screen = as.character(abstract_crossref)
+  ) %>%
+  group_by(dedupe_key) %>%
+  slice(1) %>%   # keep first occurrence per dedupe key
+  ungroup() %>%
+  select(
+    screen_id,
+    any_of(c(
+      "nbs_id","nbs_name","query_mode","retrieved_at","rank",
+      "openalex_id","openalex_url","doi","doi_clean",
+      "publication_year","type","cited_by_count","relevance_score",
+      "pdf_url","landing_page_url","oa_status","authors","query_used",
+      "journal_name","journal_impact_factor","citations_per_year","priority_score",
+      "source_file"
+    )),
+    title, abstract_for_screen,
+    doi_key, openalex_id_chr, dedupe_key
+  ) %>%
+  distinct(screen_id, .keep_all = TRUE)
+
+message("Rows after dedupe (to screen): ", nrow(dat))
+
+# ---------- Prompt ----------
+prompt <- "
+You are screening titles and abstracts of scientific literature.
+
+DECIDE: Include (1) or Exclude (0).
+
+INCLUDE only if the paper is (A) about one or more of the priority NbS practices AND
+(B) describes a spatial prioritisation / suitability / targeting approach.
+
+Priority NbS practices (10):
+- Agroforestry; Agrosilvopastoralism/Silvopastoralism
+- Forest conservation and restoration; Reforestation; Afforestation; Community-based forest management
+- Wetland management; Constructed wetlands; Riparian buffers; Water harvesting and conservation
+- Integrated fire management
+
+EXCLUDE if any apply:
+1) Not one of the NbS practices listed above.
+2) Conceptual/narrative without a concrete spatial method.
+3) Tree/species-only suitability (e.g, suitability of pine trees in a certain forest) We are more looking for suitability of the overall NbS rather than species only we look for broader.
+4) Monitoring/mapping only (tree cover/wetlands mapping) without prioritisation/suitability/targeting.
+5) Outcomes-only without spatial prioritisation/suitability approach.
+6) Governance/participation without transferable spatial prioritisation approach or spatial output.
+7) Reviews/meta-analyses/systematic reviews (unless operational spatial method; otherwise exclude).
+
+
+Return ONLY:
+- decision_binary: 1 for Include, 0 for Exclude
+- short_reason: max 25 words
+"
+
+# ---------- Cost estimate ----------
+cost_obj <- approximate_price_gpt(
+  data     = dat,
+  prompt   = prompt,
+  studyid  = screen_id,
+  title    = title,
+  abstract = abstract_for_screen,
+  model    = model_name,
+  reps     = reps_n
+)
+print(cost_obj)
+print(cost_obj$price_dollar)
+
+# ---------- Run AI screening ----------
+plan(multisession, workers = n_workers)
+
+screen_obj <- tabscreen_gpt(
+  data     = dat,
+  prompt   = prompt,
+  studyid  = screen_id,
+  title    = title,
+  abstract = abstract_for_screen,
+  model    = model_name,
+  reps     = reps_n
+)
+
+plan(sequential)
+
+ai_out <- screen_obj$answer_data
+
+ai_keep <- ai_out %>%
+  select(any_of(c("screen_id", "studyid", "decision_binary", "short_reason", "reason", "answer"))) %>%
+  mutate(screen_id = dplyr::coalesce(as.character(screen_id), as.character(studyid))) %>%
+  select(-any_of("studyid"))
+
+screened <- dat %>%
+  left_join(ai_keep, by = "screen_id") %>%
+  mutate(
+    decision_binary = as.integer(decision_binary),
+    decision_binary = if_else(is.na(decision_binary), NA_integer_, decision_binary)
+  )
+
+# ---------- Save outputs ----------
+readr::write_csv(screened, "openalex_screened_with_ai_decisions_ALL.csv")
+readr::write_csv(screened %>% filter(decision_binary == 1), "openalex_included_ai_ALL.csv")
+readr::write_csv(screened %>% filter(decision_binary == 0), "openalex_excluded_ai_ALL.csv")
+
+message("Saved: openalex_screened_with_ai_decisions_ALL.csv")
+
+
+```
+
+
+```{r}
+# ============================================================
+# CHUNK 2 — Compare to MANUAL screening (merge ALL manual Excels + DOI-only match)
+#   - Reads ALL .xlsx in Lolita + Namita folders
+#   - Robust to type mismatches (read everything as text)
+#   - Dedupe manual on DOI (keeps first; reports duplicates)
+#   - DOI-only join to AI-screened output
+# ============================================================
+
+library(readxl)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(tidyr)
+library(tibble)
+library(scales)
+library(DT)
+
+# ---------- EDIT PATHS ----------
+manual_root <- "C:/Users/mlolita/OneDrive - CGIAR/Alliance - ClimateActionNetZero - 1_Projects/D591_Rural-Scan_NBS/2_Technical_&_Data/Stocktake Review/Manual Screening"
+
+# Expecting subfolders like:
+#   Manual Screening/Lolita/*.xlsx
+#   Manual Screening/Namita/*.xlsx
+
+manual_files <- list.files(
+  manual_root,
+  pattern = "\\.xlsx$",
+  full.names = TRUE,
+  recursive = TRUE
+)
+
+if (length(manual_files) == 0) stop(paste0("No .xlsx files found under: ", manual_root))
+
+message("Manual files found: ", length(manual_files))
+
+# ---------- robust reader: read EVERYTHING as text to avoid bind_rows type conflicts ----------
+read_manual_one <- function(fp) {
+
+  reviewer <- basename(dirname(fp))
+
+  x <- readxl::read_excel(
+    fp,
+    col_types = "text"   # KEY FIX: forces all columns to character
+  )
+
+  # Must have a doi column
+  if (!("doi" %in% names(x))) {
+    warning(paste0("Skipping (no 'doi' column): ", fp))
+    return(tibble())
+  }
+
+  status_candidates <- c(
+    "Incliuded/Excluded",
+    "Included/Excluded",
+    "Included_Excluded",
+    "Decision",
+    "decision",
+    "Status",
+    "status"
+  )
+  status_col <- intersect(names(x), status_candidates)[1]
+  if (is.na(status_col)) {
+    warning(paste0("Skipping (no decision column found): ", fp))
+    return(tibble())
+  }
+
+  x %>%
+    mutate(
+      doi = as.character(.data[["doi"]]),
+      doi_key = str_to_lower(str_trim(doi)),  # minimal cleaning join key
+
+      manual_status = str_to_lower(str_trim(as.character(.data[[status_col]]))),
+      human_code = case_when(
+        manual_status %in% c("included", "include", "in", "1") ~ 1L,
+        manual_status %in% c("excluded", "exclude", "out", "0") ~ 0L,
+        TRUE ~ NA_integer_
+      ),
+
+      exclusion_criteria = if ("Exclusion criteria" %in% names(x)) {
+        as.character(.data[["Exclusion criteria"]])
+      } else {
+        NA_character_
+      },
+
+      reviewer = reviewer,
+      manual_source_file = basename(fp)
+    ) %>%
+    filter(!is.na(doi_key) & doi_key != "" & !is.na(human_code)) %>%
+    select(doi, doi_key, human_code, exclusion_criteria, reviewer, manual_source_file, everything())
+}
+
+manual_all_raw <- purrr::map_dfr(manual_files, read_manual_one)
+
+message("Manual rows (raw, after filtering to labeled + has DOI): ", nrow(manual_all_raw))
+
+# ---------- manual duplicate reporting + dedupe (by DOI key) ----------
+manual_dup_tbl <- manual_all_raw %>%
+  count(doi_key, name = "n") %>%
+  filter(n > 1)
+
+n_manual_dup_keys <- nrow(manual_dup_tbl)
+n_manual_dup_rows <- if (n_manual_dup_keys == 0) 0 else (sum(manual_dup_tbl$n) - n_manual_dup_keys)
+
+message("Manual duplicate DOI keys (n > 1): ", n_manual_dup_keys)
+message("Manual duplicate rows beyond first: ", n_manual_dup_rows)
+
+# Keep first label per DOI (you can change ordering if you want reviewer priority)
+manual_all <- manual_all_raw %>%
+  group_by(doi_key) %>%
+  slice(1) %>%
+  ungroup()
+
+message("Manual rows after dedupe: ", nrow(manual_all))
+
+# ---------- prep AI screened (from Chunk 1) ----------
+# screened must exist in your environment from Chunk 1
+if (!exists("screened")) stop("Object 'screened' not found. Run CHUNK 1 first.")
+
+ai_for_join <- screened %>%
+  mutate(
+    doi = as.character(doi),
+    doi_key = str_to_lower(str_trim(doi))
+  )
+
+# Optional: report AI duplicate DOIs *in screened* (post-dedupe there should be 0)
+ai_dup_tbl <- ai_for_join %>%
+  filter(!is.na(doi_key) & doi_key != "") %>%
+  count(doi_key, name = "n") %>%
+  filter(n > 1)
+
+message("AI duplicate DOI keys in screened (should be 0 if dedupe worked): ", nrow(ai_dup_tbl))
+
+# ---------- DOI-only comparison join ----------
+comp <- ai_for_join %>%
+  left_join(
+    manual_all %>% select(doi_key, human_code, exclusion_criteria, reviewer, manual_source_file),
+    by = "doi_key"
+  )
+
+comp_eval <- comp %>% filter(!is.na(decision_binary) & !is.na(human_code))
+
+if (nrow(comp_eval) == 0) {
+
+  n_overlap <- length(intersect(
+    na.omit(unique(ai_for_join$doi_key)),
+    na.omit(unique(manual_all$doi_key))
+  ))
+
+  warning(paste0(
+    "No overlaps with BOTH AI and manual labels after DOI-only join.\n",
+    "Overlap count (unique doi_key intersection): ", n_overlap, "\n",
+    "Most common cause: DOIs differ as strings across sources.\n",
+    "Since you asked for DOI-only matching, the only fix is to ensure both sides store DOIs in the same string format."
+  ))
+
+} else {
+
+  conf_long <- comp_eval %>%
+    mutate(
+      outcome = case_when(
+        human_code == 1 & decision_binary == 1 ~ "TP",
+        human_code == 1 & decision_binary == 0 ~ "FN",
+        human_code == 0 & decision_binary == 1 ~ "FP",
+        human_code == 0 & decision_binary == 0 ~ "TN",
+        TRUE ~ NA_character_
+      )
+    )
+
+  counts <- conf_long %>%
+    count(outcome) %>%
+    tidyr::pivot_wider(names_from = outcome, values_from = n, values_fill = 0)
+
+  TP <- if ("TP" %in% names(counts)) counts$TP else 0
+  TN <- if ("TN" %in% names(counts)) counts$TN else 0
+  FP <- if ("FP" %in% names(counts)) counts$FP else 0
+  FN <- if ("FN" %in% names(counts)) counts$FN else 0
+
+  tot <- nrow(comp_eval)
+
+  accuracy  <- (TP + TN) / tot
+  precision <- ifelse((TP + FP) == 0, NA_real_, TP / (TP + FP))
+  recall    <- ifelse((TP + FN) == 0, NA_real_, TP / (TP + FN))
+  f1        <- ifelse(is.na(precision) | is.na(recall) | (precision + recall) == 0,
+                      NA_real_, 2 * precision * recall / (precision + recall))
+
+  summary_tbl <- tibble::tibble(
+    Metric = c(
+      "True positives (TP) — manual Included, AI Include",
+      "True negatives (TN) — manual Excluded, AI Exclude",
+      "False negatives (FN) — manual Included, AI Exclude",
+      "False positives (FP) — manual Excluded, AI Include",
+      "Total compared (overlap)",
+      "Accuracy",
+      "Precision (PPV)",
+      "Recall (Sensitivity)",
+      "F1 score"
+    ),
+    Value = c(
+      TP, TN, FN, FP, tot,
+      scales::percent(accuracy, accuracy = .1),
+      ifelse(is.na(precision), NA, scales::percent(precision, accuracy = .1)),
+      ifelse(is.na(recall), NA, scales::percent(recall, accuracy = .1)),
+      ifelse(is.na(f1), NA, round(f1, 3))
+    )
+  )
+
+  DT::datatable(
+    summary_tbl,
+    rownames = FALSE,
+    options  = list(dom = "t", ordering = FALSE),
+    caption  = "Manual vs AI screening — DOI-only confusion matrix summary & metrics"
+  )
+
+  # Save detailed comparison for auditing
+  readr::write_csv(
+    comp %>%
+      mutate(
+        manual_decision = case_when(
+          human_code == 1 ~ "Included",
+          human_code == 0 ~ "Excluded",
+          TRUE ~ NA_character_
+        )
+      ),
+    "openalex_manual_vs_ai_comparison_DOIonly_ALLreviewers.csv"
+  )
+
+  message("Saved: openalex_manual_vs_ai_comparison_DOIonly_ALLreviewers.csv")
+}
+
+
+```
