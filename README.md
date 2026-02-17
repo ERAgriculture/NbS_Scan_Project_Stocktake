@@ -136,9 +136,10 @@ Outputs are written to `data/` as `.csv` and `.bib`.
   - AI screening package if used (e.g., `AIscreenR`)
 
 <div style="display: flex; gap: 8px;">
-  <img src="https://github.com/user-attachments/assets/9c1ab9b2-8d36-4ae4-8a20-494b7d692911" width="48%" />
+  <img src="https://github.com/user-attachments/assets/7914560c-4856-4b0f-bb23-6d44d698ec4e" width="48%" />
   <img src="https://github.com/user-attachments/assets/91c9aaf3-e2e8-44e9-a28c-2243a815e440" width="48%" />
 </div>
+
 
 
 
