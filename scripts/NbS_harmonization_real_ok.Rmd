@@ -1,0 +1,660 @@
+---
+title: "harmonization"
+output: html_document
+date: "2026-02-06"
+---
+# ============================================================================
+# NbS STOCKTAKE - DATA HARMONIZATION TO TYPOLOGY
+# ============================================================================
+# 
+# PURPOSE: Map extracted free-text values to standardized typology categories
+# 
+# WORKFLOW:
+#   PART 1: Setup & Load Results
+#   PART 2: Define Harmonization Prompts
+#   PART 3: Run Harmonization
+#   PART 4: Save Harmonized Results
+#
+# ============================================================================
+
+# Load libraries
+```{r libraries}
+library(dplyr)
+library(glue)
+library(readr)
+library(writexl)
+library(ellmer)
+library(DT)
+```
+
+# ============================================================================
+# PART 1: CONFIGURATION & LOAD DATA
+# ============================================================================
+```{r config}
+# ----- API Configuration -----
+openai_api_key <- Sys.getenv("NBS_API_KEY")
+GPT_MODEL <- "gpt-5"
+
+# ----- Paths -----
+# Input: Results from extraction
+INPUT_RESULTS <- "C:/PDFs_extracted_text/extraction_results/nbs_extraction_results_66.csv"
+
+# Output directory
+OUT_DIR <- "C:/PDFs_extracted_text/harmonization_results"
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# ----- Helper Functions -----
+`%||%` <- function(a, b) if (!is.null(a) && !is.na(a) && nzchar(a)) a else b
+
+# Safe API call wrapper
+safe_chat <- function(prompt, model = GPT_MODEL) {
+  tryCatch({
+    chat <- ellmer::chat_openai(model = model)
+    resp <- chat$chat(prompt)
+    list(response = trimws(resp), error = NA_character_)
+  }, error = function(e) {
+    list(response = NA_character_, error = conditionMessage(e))
+  })
+}
+```
+
+```{r load_data}
+# Load extraction results
+if (file.exists(INPUT_RESULTS)) {
+  extraction_results <- read.csv(INPUT_RESULTS)
+  message(glue("Loaded {nrow(extraction_results)} papers for harmonization"))
+} else {
+  stop(glue("Input file not found: {INPUT_RESULTS}"))
+}
+```
+
+# ============================================================================
+# PART 2: HARMONIZATION PROMPTS
+# ============================================================================
+```{r harmonization_prompts}
+# ----- Prompt: Harmonize Input Variables -----
+harmonize_input_variables <- function(raw_value) {
+  glue('
+You are harmonizing extracted data to a standardized typology.
+
+RAW EXTRACTED VALUE:
+"""
+{raw_value}
+"""
+
+Map each variable/data layer mentioned above to ONE of these standardized categories from the GEE Awesome Catalog typology:
+
+1. Population and Socioeconomic Datasets
+2. Hydrology Datasets
+3. Global Land Use and Land Cover Datasets
+4. Climate and Weather Datasets
+5. Elevation and terrain
+6. Soil properties and geology
+7. Biodiversity, ecosystems and habitat
+8. Earth observations imagery and derived indices
+9. Build environment and infrastructure
+10. Hazard disturbance and events
+11. Governance management and institutional indicators
+
+RULES:
+- Map each variable to the MOST appropriate category
+- If a variable fits multiple categories, choose the PRIMARY category
+- Format: Category name; Category name; Category name
+- Keep the order of variables as they appear in the raw value
+- Use exact category names from the list above
+- Output ONLY the category names separated by semicolons
+- If the raw value is NA or no variables are present, return NA
+
+EXAMPLES:
+Input: "Slope; Rainfall; Population density; NDVI"
+Output: Elevation and terrain; Climate and Weather Datasets; Population and Socioeconomic Datasets; Earth observations imagery and derived indices
+
+Input: "DEM; Soil pH; Distance to roads"
+Output: Elevation and terrain; Soil properties and geology; Build environment and infrastructure
+
+Output only the harmonized categories on a single line. No explanation.')
+}
+
+# ----- Prompt: Harmonize Input Variable Resolution -----
+harmonize_input_resolution <- function(raw_value) {
+  glue('
+You are harmonizing extracted data to a standardized typology.
+
+RAW EXTRACTED VALUE:
+"""
+{raw_value}
+"""
+
+Map the resolution(s) to ONE of these standardized categories:
+
+1. Not reported
+2. Non gridded / admin / qualitative
+3. High: <30m
+4. Medium: 30-250m
+5. Coarse: 250m-1km
+6. Very coarse: >1km
+
+
+RULES:
+- If multiple resolutions with different categories are present, list them separated by semicolumns
+- If resolution mentioned is administrative/vector/qualitative, use "Non gridded / admin / qualitative"
+- Examples:
+  * "30m" → High: <30m
+  * "100m" → Medium: 30-250m
+  * "1km" → Coarse: 250m-1km
+  * "10km" → Very coarse: >1km
+  * "county-level" → Non gridded / admin / qualitative
+  * "not specified" → Not reported
+- Use exact category names from the list above
+- Output ONLY ONE category name
+- If raw value is NA, return "Not reported"
+
+Output only the harmonized category on a single line. No explanation.')
+}
+
+# ----- Prompt: Harmonize Spatial Method -----
+harmonize_spatial_method <- function(raw_value) {
+  glue('
+You are harmonizing extracted spatial method descriptions to a standardized typology.
+
+RAW EXTRACTED VALUE:
+"""
+{raw_value}
+"""
+
+Map the spatial method(s) to ONE or MORE of these standardized categories:
+
+1. MCDA / MCE
+   Methods that evaluate spatial units against multiple criteria using explicit weighting and aggregation to produce a composite suitability or priority score. Each unit is scored independently.
+   Includes: AHP with weighted overlay, Weighted Linear Combination (WLC), Weighted Sum, Ordered Weighted Averaging (OWA), fuzzy MCDA (fuzzy membership + fuzzy operators as aggregation), PROMETHEE, ELECTRE, TOPSIS, entropy weighting, FUCOM, DEMATEL-weighted overlays, matter-element analysis with AHP weights, Spatial UTA, SMART with weighted combination, Choquet integral MCDA, any multi-criteria evaluation producing a weighted composite map.
+   Signal: The method explicitly assigns WEIGHTS to criteria and combines them via aggregation into a continuous suitability surface.
+
+2. Rule-based GIS Overlay and constraints
+   Methods that apply deterministic decision rules — Boolean logic, fixed thresholds, buffer distances, intersection/union operations, limiting-factor classification — to categorise or filter areas WITHOUT computing weighted composite scores. This must be a SUBSTANTIVE analytical step that shapes the final prioritisation, not routine pre-filtering.
+   Includes: Boolean overlay (AND/OR logic on binary layers), threshold screening (slope ≤ 2%, forest cover ≥ 75%), exclusion/constraint masking, buffer-based delineation, FAO 1976 limiting-factor land evaluation, attribute-based if-then decision rule sets, GIS union/intersect producing categorical suitability.
+   Signal: No explicit weighting of criteria. Areas included or excluded based on fixed rules. Output is binary or categorical, not a continuous weighted index.
+   IMPORTANT: Do NOT tag this category when Boolean constraints or exclusion masks are used merely as a routine pre-filtering step before MCDA (e.g. removing urban areas before running AHP). Only tag it when rule-based logic is itself a primary or co-primary analytical method that produces a distinct prioritisation output.
+
+3. Machine learning and statistical prediction
+   Data-driven models trained on observed response data (presence/absence, field plots, classified samples) to predict SUITABILITY, PROBABILITY, or CLASS MEMBERSHIP for the target NbS application across space. The ML model must be the method that produces or substantially contributes to the final suitability/priority output.
+   Includes: MaxEnt, GARP, Random Forest, SVM, Gradient Boosting (XGBoost, LightGBM), Neural Networks (ANN, CNN, U-Net), ensemble SDMs (biomod2), logistic regression, GAM/GLM for habitat or restoration suitability prediction, CART for suitability prediction, Bayesian networks predicting suitability or risk, Weight-of-evidence modelling, unsupervised clustering for suitability zoning (k-means, ISODATA applied to suitability attributes).
+   Signal: The method requires TRAINING DATA and produces a predictive surface based on learned statistical relationships.
+   IMPORTANT: Do NOT tag this category for remote sensing image classification (e.g. Maximum Likelihood, ISODATA, supervised classification of satellite imagery) when it is used solely to derive input LULC maps. Only tag it when the ML/statistical model is the method that predicts suitability or priority itself.
+
+4. Process-based biophysical models
+   Named mechanistic or semi-empirical simulation models that simulate physical, hydrological, ecological, or biogeochemical processes to quantify spatially explicit biophysical outcomes.
+   Includes: SCS-CN runoff model, RUSLE/USLE/RWEQ erosion models, SWAT, HEC-RAS/HEC-GeoHMS, InVEST (SDR, nutrient retention, carbon storage, habitat quality), ARIES, WaterWorld, FlamMap/fire behaviour models, AnnAGNPS/NetMap sediment models, RestSim, Chapman-Richards growth models, COMET-Planner, MEDALUS environmental sensitivity index.
+   Signal: The model applies PROCESS EQUATIONS from a named simulation framework to spatially distributed inputs to produce quantitative biophysical outputs (e.g. runoff volume, sediment yield, carbon stock, erosion rate, fire spread).
+   IMPORTANT: Do NOT tag this category for basic DEM-derived terrain variables (flow accumulation, slope, aspect, Topographic Wetness Index, Compound Topographic Index, stream order, Strahler order, morphometric parameters) when these are used as input layers for another method. These are terrain characterisation, not process-based simulation. Only tag when a named biophysical simulation model (SCS-CN, RUSLE, InVEST, SWAT, HEC-RAS, FlamMap, etc.) is explicitly applied.
+
+5. Spatial optimisation
+   Mathematical optimisation algorithms that identify the best-performing SET of spatial units subject to explicit objectives and constraints. Selection is interdependent — the value of adding a site depends on what other sites are already selected.
+   Includes: Marxan/MARZONE (simulated annealing), Zonation, prioritizr (ILP/MILP), linear/integer/mixed-integer programming for site selection, NSGA-II and multi-objective evolutionary algorithms for spatial allocation, Pareto-front analysis for site selection, compromise programming for spatial allocation, goal programming for spatial allocation, 0-1 integer programming, PLANGEA, marginal abatement cost curve construction, CoMOLA.
+   Signal: The method solves an OPTIMISATION PROBLEM with a defined objective function, decision variables (which spatial units to select or what to allocate), and constraints (budget, area targets, connectivity). The output is a SELECTED PORTFOLIO of sites or an optimal spatial allocation.
+   IMPORTANT: Do NOT tag this category when goal programming or compromise programming is used solely to DERIVE WEIGHTS for an MCDA overlay. If the optimisation derives weights that then feed into a WLC/AHP, that is MCDA, not Spatial optimisation. Only tag when the optimisation directly selects or allocates across spatial units.
+
+6. Scenario and land-change modelling
+   Methods that simulate alternative future land-use trajectories or evaluate NbS performance under different management, policy, or climate scenarios. Priorities emerge from comparing scenario outcomes.
+   Includes: Cellular automata / Dinamica EGO transition simulations, CLUE-S, climate-envelope projections (SDM projected onto future CMIP climate surfaces to map future suitability shifts), scenario comparison frameworks (deforestation vs. restoration scenarios evaluated via ES models), Weight-of-evidence Bayesian landscape-dynamics modelling simulating future transitions.
+   Signal: The method simulates FUTURE STATES or compares ALTERNATIVE SCENARIOS to derive priorities, rather than assessing current-condition suitability alone.
+   IMPORTANT: Do NOT tag this category when Dinamica EGO or similar platforms are used purely as a spatial modelling environment for current-condition multicriteria analysis without simulating future trajectories.
+
+7. Participatory / expert-driven DSS
+   Methods where spatial priorities are derived primarily through structured stakeholder or expert engagement, with GIS as visualisation platform. The final prioritisation step is human judgment.
+   Includes: Participatory GIS / participatory mapping, Delphi expert panels for spatial priority identification, stakeholder-elicited suitability scoring (direct rating/ranking of locations by stakeholders), community-based spatial planning workshops.
+   Signal: The PRIMARY analytical step is expert or stakeholder judgment DIRECTLY producing spatial priorities. AHP where experts provide pairwise weights that feed into an algorithmic weighted overlay is MCDA, not this category. Only tag this when experts or stakeholders directly delineate, score, or rank priority areas as the main analytical step.
+
+RULES:
+- Map each method to the MOST appropriate category
+- A paper can use multiple categories — list all that apply separated by semicolons
+- Use EXACT category names from the list above
+- If the raw value describes no identifiable spatial method or is NA, return NA
+- If the raw value is too vague to classify confidently, return Unclear
+
+Output only the harmonized category/categories on a single line, separated by semicolons. No explanation.')
+}
+
+
+# ----- Prompt: Harmonize Method Validation -----
+harmonize_method_validation <- function(raw_value) {
+  glue('
+You are harmonizing extracted data to a standardized typology.
+
+RAW EXTRACTED VALUE:
+"""
+{raw_value}
+"""
+
+Map the validation approach(es) to ONE or MORE of these standardized categories:
+
+1. Field verification/ground-truthing
+2. Comparison with existing NbS sites or known locations
+3. Comparison with independent datasets
+4. Cross-validation (k-fold, leave-one-out)
+5. Split-sample validation (training/test data)
+6. Expert review or stakeholder validation
+7. Comparison with other models or studies
+8. Sensitivity analysis
+9. Uncertainty analysis
+
+RULES:
+- Map each validation approach to the MOST appropriate category
+- Multiple validation approaches can be present - list all that apply separated by semicolumns
+- Format: Category name; Category name
+- Use exact category names from the list above
+- If raw value is NA or no validation mentioned, return NA
+
+Output only the harmonized category/categories on a single line. No explanation.')
+}
+
+# ----- Prompt: Harmonize Analysis Resolution -----
+harmonize_analysis_resolution <- function(raw_value) {
+  glue('
+You are harmonizing extracted data to a standardized typology.
+
+RAW EXTRACTED VALUE:
+"""
+{raw_value}
+"""
+
+Map the analysis resolution to ONE of these standardized categories:
+
+1. Not reported
+2. Raster cell size (high: <30m)
+3. Raster cell size (medium: 30-250m)
+4. Raster cell size (coarse: 250m-1km)
+5. Raster cell size (very coarse: >1km)
+6. Regular grid
+7. Irregular planning units
+8. Administrative units
+9. Hydrological units
+
+RULES:
+- Choose the SINGLE most appropriate category
+- If multiple resolutions at different scales, choose the PRIMARY analysis resolution
+- Examples:
+  * "30m resolution" → Raster cell size (high: <30m)
+  * "100m pixels" → Raster cell size (medium: 30-250m)
+  * "1km grid" → Raster cell size (coarse: 250m-1km)
+  * "10km x 10km grid" → Raster cell size (very coarse: >1km)
+  * "county-level" → Administrative units
+  * "watershed-based" → Hydrological units
+  * "hexagon grid 5km spacing" → Regular grid
+- Use exact category names from the list above
+- If raw value is NA or not specified, return "Not reported"
+
+Output only ONE harmonized category on a single line. No explanation.')
+}
+
+# ----- Prompt: Harmonize Output -----
+harmonize_output <- function(raw_value) {
+  glue('
+You are harmonizing extracted data to a standardized typology.
+
+RAW EXTRACTED VALUE:
+"""
+{raw_value}
+"""
+
+STEP 1 — FILTER: SKIP items that are input layers or intermediates:
+- Slope, DEM, NDVI, soil, rainfall, temperature, runoff depth/coefficient, 
+  drainage, stream order, land cover baselines, population, proximity layers
+- Runoff potential/depth maps are inputs, not ecosystem service outputs
+- Sub-criterion or single-factor suitability maps (soil-based, rainfall-based) 
+  that feed into a composite are intermediates, not final outputs
+
+STEP 2 — CLASSIFY remaining items into ONE or MORE categories:
+
+1. Suitability / feasibility maps
+2. Priority / ranking maps
+3. Vulnerability / risk / hazard maps
+4. Ecosystem service / biophysical quantification
+5. Conservation network / selection solutions: Spatial optimization outputs
+6. Scenarios comparisons / trade-offs
+7. Economic outputs
+8. Land use allocation maps
+9. Non-Spatial decision outputs
+
+KEY RULES:
+- "Conservation network" is ONLY for formal spatial optimization algorithms 
+  (Marxan, Zonation, ILP, simulated annealing). Proposed site locations 
+  (dam sites, pond sites, structure placements, flow-interception points) 
+  derived from suitability mapping or rule-based allocation are part of 
+  "Suitability / feasibility maps", NOT Conservation network.
+- "Scenarios comparisons" requires genuinely different assumptions or 
+  parameters being compared. Spatial aggregation of the same index at 
+  different admin levels is NOT a scenario comparison.
+- "Vulnerability / risk / hazard maps" is for maps of climate/environmental 
+  hazards or risk to people/ecosystems. Reservoir inundation extents for 
+  proposed infrastructure are engineering outputs, not vulnerability maps.
+- Each category only ONCE per paper
+- Format: Category; Category
+- If nothing remains after filtering, return NA
+
+Output only the categories on a single line. No explanation.')
+}
+
+# ----- Prompt: Harmonize Climate Risk Assessment -----
+harmonize_climate_risk <- function(raw_value) {
+  glue('
+You are harmonizing extracted data to a standardized typology.
+
+RAW EXTRACTED VALUE:
+"""
+{raw_value}
+"""
+
+Map the climate risk approach to ONE of these standardized categories:
+
+1. None
+2. Baseline climate predictors: Uses temperature/precip/bioclim variables but not framed as hazard/vulnerability
+3. Historical hazard/event layers: Uses observed/historical floods/fires/storms etc as hazards
+4. Variability/trend/probabilistic climate: Uses time series trends drought indices, exceedance probabilities
+5. Future climate/SLR scenarios: Explicit projections
+6. Full risk framework: Explicit hazard + exposure + vulnerability
+
+RULES:
+- Choose the SINGLE most comprehensive/advanced category that applies
+- Hierarchy (if multiple apply, choose highest):
+  * Full risk framework > Future scenarios > Variability/trends > Historical hazards > Baseline climate > None
+- Examples:
+  * "No" → None
+  * "Uses temperature and rainfall as inputs" → Baseline climate predictors
+  * "Historical flood zones used" → Historical hazard/event layers
+  * "RCP 4.5 and 8.5 scenarios" → Future climate/SLR scenarios
+  * "Vulnerability assessment with hazard, exposure, and adaptive capacity" → Full risk framework
+- Use exact category names from the list above
+
+Output only ONE harmonized category on a single line. No explanation.')
+}
+
+# ----- Prompt: Harmonize Economics -----
+harmonize_economics <- function(raw_value) {
+  glue('
+You are harmonizing extracted data to a standardized typology.
+
+RAW EXTRACTED VALUE:
+"""
+{raw_value}
+"""
+
+Map the economic analysis to ONE of these standardized categories:
+
+1. None
+2. Cost mapping: Spatially explicit cost estimates are produced but no aggregation comparison or valuation of benefits
+3. Economic feasibility / cost comparison: Costs are compared, ranked or used to assess feasibility
+4. Monetized ecosystem service valuation
+5. Cost benefit analysis
+6. Net present value
+7. Cost effectiveness optimization
+
+RULES:
+- Choose the SINGLE most comprehensive/advanced category that applies
+- Hierarchy (if multiple apply, choose highest):
+  * Cost effectiveness optimization > Net present value > Cost benefit analysis > Monetized ES valuation > Economic feasibility > Cost mapping > None
+- Examples:
+  * "No" → None
+  * "Implementation costs mapped" → Cost mapping
+  * "Costs compared across regions" → Economic feasibility / cost comparison
+  * "Ecosystem services valued in dollars" → Monetized ecosystem service valuation
+  * "NPV calculated for 20-year period" → Net present value
+  * "Benefit-cost ratio computed" → Cost benefit analysis
+- Use exact category names from the list above
+
+Output only ONE harmonized category on a single line. No explanation.')
+}
+
+# ----- Prompt: Harmonize Geographic Scope -----
+harmonize_geographic_scope <- function(raw_value) {
+  glue('
+You are harmonizing extracted data to a standardized typology.
+
+RAW EXTRACTED VALUE:
+"""
+{raw_value}
+"""
+
+Map the geographic scope to ONE of these continental categories:
+
+1. Africa
+2. Europe
+3. North America
+4. South America
+5. Oceania
+6. Asia
+7. Global / Multicontinental
+
+RULES:
+- Extract ONLY the continental/regional category
+- If multiple countries from same continent, use that continent
+- If multiple countries from different continents, use "Global / Multicontinental"
+- Examples:
+  * "Sub-national: Ethiopia" → Africa
+  * "National: Kenya" → Africa
+  * "Multi-country: South Asia" → Asia
+  * "Sub-national: Iceland" → Europe
+  * "National: USA" → North America
+  * "Multi-country: Kenya and India" → Global / Multicontinental
+- Use exact category names from the list above
+- If raw value is NA, return NA
+
+Output only ONE harmonized category on a single line. No explanation.')
+}
+```
+
+# ============================================================================
+# PART 3: HARMONIZATION FUNCTIONS
+# ============================================================================
+```{r harmonization_functions}
+# ----- Single variable harmonizer -----
+harmonize_single_variable <- function(results_df, raw_column, 
+                                     harmonize_fn, harmonized_column_name) {
+  
+  n_papers <- nrow(results_df)
+  harmonized <- vector("character", n_papers)
+  
+  pb <- txtProgressBar(min = 0, max = n_papers, style = 3)
+  
+  for (i in seq_len(n_papers)) {
+    raw_value <- results_df[[raw_column]][i] %||% "NA"
+    
+    # Skip if already NA
+    if (is.na(raw_value) || raw_value == "NA") {
+      harmonized[i] <- NA_character_
+      setTxtProgressBar(pb, i)
+      next
+    }
+    
+    # Build prompt
+    prompt <- harmonize_fn(raw_value)
+    
+    # Call API
+    resp <- safe_chat(prompt)
+    
+    if (!is.na(resp$error)) {
+      harmonized[i] <- NA_character_
+      warning(glue("Error harmonizing {harmonized_column_name} for paper {i}: {resp$error}"))
+    } else {
+      harmonized[i] <- resp$response
+    }
+    
+    setTxtProgressBar(pb, i)
+    Sys.sleep(0.5)  # Rate limiting
+  }
+  
+  close(pb)
+  harmonized
+}
+```
+
+# ============================================================================
+# PART 4: RUN HARMONIZATION
+# ============================================================================
+```{r run_harmonization, eval=FALSE}
+# Initialize harmonized results with original data
+harmonized_results <- extraction_results
+
+# ----- Harmonize each variable -----
+
+# === Input Variables ===
+message("\n=== Harmonizing Input Variables ===")
+harmonized_results$Input_Variables_Harmonized <- harmonize_single_variable(
+  harmonized_results,
+  raw_column = "Input_Variables",
+  harmonize_fn = harmonize_input_variables,
+  harmonized_column_name = "Input_Variables_Harmonized"
+)
+
+# === Input Variable Resolution ===
+message("\n=== Harmonizing Input Variable Resolution ===")
+harmonized_results$Input_Variable_Resolution_Harmonized <- harmonize_single_variable(
+  harmonized_results,
+  raw_column = "Input_Variable_Resolution",
+  harmonize_fn = harmonize_input_resolution,
+  harmonized_column_name = "Input_Variable_Resolution_Harmonized"
+)
+
+# === Spatial Method ===
+message("\n=== Harmonizing Spatial Method ===")
+harmonized_results$Spatial_Method_Harmonized <- harmonize_single_variable(
+  harmonized_results,
+  raw_column = "Spatial_Method",
+  harmonize_fn = harmonize_spatial_method,
+  harmonized_column_name = "Spatial_Method_Harmonized"
+)
+
+
+message("\n=== Harmonizing Method Validation ===")
+harmonized_results$Method_Validation_Harmonized <- harmonize_single_variable(
+  harmonized_results,
+  raw_column = "Method_Validation",
+  harmonize_fn = harmonize_method_validation,
+  harmonized_column_name = "Method_Validation_Harmonized"
+)
+
+# === Analysis Resolution ===
+message("\n=== Harmonizing Analysis Resolution ===")
+harmonized_results$Analysis_Resolution_Harmonized <- harmonize_single_variable(
+  harmonized_results,
+  raw_column = "Analysis_Resolution",
+  harmonize_fn = harmonize_analysis_resolution,
+  harmonized_column_name = "Analysis_Resolution_Harmonized"
+)
+
+# === Output ===
+message("\n=== Harmonizing Output ===")
+harmonized_results$Output_Harmonized <- harmonize_single_variable(
+  harmonized_results,
+  raw_column = "Output",
+  harmonize_fn = harmonize_output,
+  harmonized_column_name = "Output_Harmonized"
+)
+
+# === Climate Risk Assessment ===
+message("\n=== Harmonizing Climate Risk Assessment ===")
+harmonized_results$Climate_Risk_Assessment_Harmonized <- harmonize_single_variable(
+  harmonized_results,
+  raw_column = "Climate_Risk_Assessment",
+  harmonize_fn = harmonize_climate_risk,
+  harmonized_column_name = "Climate_Risk_Assessment_Harmonized"
+)
+
+# === Economics ===
+message("\n=== Harmonizing Economics ===")
+harmonized_results$Economics_Harmonized <- harmonize_single_variable(
+  harmonized_results,
+  raw_column = "Economics",
+  harmonize_fn = harmonize_economics,
+  harmonized_column_name = "Economics_Harmonized"
+)
+
+# === Geographic Scope ===
+message("\n=== Harmonizing Geographic Scope ===")
+harmonized_results$Geographic_Scope_Harmonized <- harmonize_single_variable(
+  harmonized_results,
+  raw_column = "Geographic_Scope",
+  harmonize_fn = harmonize_geographic_scope,
+  harmonized_column_name = "Geographic_Scope_Harmonized"
+)
+
+message("\n✓ Harmonization complete!")
+```
+
+# ============================================================================
+# PART 5: SAVE HARMONIZED RESULTS
+# ============================================================================
+```{r save_harmonized, eval=FALSE}
+# Save as RDS
+saveRDS(harmonized_results, file.path(OUT_DIR, "nbs_harmonized_results.rds"))
+
+# Save as CSV
+write_excel_csv(harmonized_results, file.path(OUT_DIR, "nbs_harmonized_results66.csv"))
+
+
+message(glue("\nHarmonized results saved to: {OUT_DIR}"))
+message(glue("  - nbs_harmonized_results.rds"))
+message(glue("  - nbs_harmonized_results.csv"))
+
+# ----- Summary statistics -----
+harmonization_summary <- harmonized_results %>%
+  summarise(
+    Total_Papers = n(),
+    Input_Vars_Harmonized = sum(!is.na(Input_Variables_Harmonized)),
+    Spatial_Method_Harmonized = sum(!is.na(Spatial_Method_Harmonized)),
+    Output_Harmonized = sum(!is.na(Output_Harmonized)),
+    Climate_Risk_Harmonized = sum(!is.na(Climate_Risk_Assessment_Harmonized)),
+    Economics_Harmonized = sum(!is.na(Economics_Harmonized)),
+    Geographic_Scope_Harmonized = sum(!is.na(Geographic_Scope_Harmonized))
+  )
+
+print(harmonization_summary)
+```
+
+# ============================================================================
+# PART 6: COMPARISON VIEW (Original vs Harmonized)
+# ============================================================================
+```{r comparison_view, eval=FALSE}
+# Create side-by-side comparison for review
+comparison_df <- harmonized_results %>%
+  select(
+    File,
+    NbS_Practice,
+    # Input Variables
+    Input_Variables,
+    Input_Variables_Harmonized,
+    # Spatial Method
+    Spatial_Method,
+    Spatial_Method_Harmonized,
+    # Output
+    Output,
+    Output_Harmonized,
+    # Climate Risk
+    Climate_Risk_Assessment,
+    Climate_Risk_Assessment_Harmonized,
+    # Economics
+    Economics,
+    Economics_Harmonized,
+    # Geographic Scope
+    Geographic_Scope,
+    Geographic_Scope_Harmonized
+  )
+
+# Interactive comparison table
+DT::datatable(
+  comparison_df %>%
+    mutate(across(where(is.character), ~ifelse(
+      nchar(.) > 60,
+      paste0(substr(., 1, 60), "..."),
+      .
+    ))),
+  options = list(pageLength = 10, scrollX = TRUE),
+  caption = "Original vs Harmonized Values - Comparison View"
+)
+```
+
+```{r}
+write_csv(harmonized_results, file.path(OUT_DIR, "test_harmonization_results.csv"))
+message(glue("\nTest results saved to: {OUT_DIR}/test_harmonization_results.csv"))
+```
+
+

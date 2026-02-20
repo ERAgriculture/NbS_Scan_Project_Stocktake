@@ -1,0 +1,844 @@
+---
+title: "NbS Stocktake - Benchmarking Scalability & Quality Scoring"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# ============================================================================
+# NbS STOCKTAKE - BENCHMARKING: SCALABILITY + QUALITY SCORING
+# ============================================================================
+#
+# PURPOSE:
+#   Score each paper on two dimensions:
+#
+#   DIMENSION 1 — SCALABILITY (GPT-scored from full text)
+#     A. Geographic Scope (1–3)
+#     B. Method Transferability (1–3)
+#     C. Data Input Generalizability (1–3)
+#     Scalability_Score = median(A, B, C)
+#
+#   DIMENSION 2 — EVIDENCE QUALITY (bibliometric, from OpenAlex)
+#     Based on Journal Impact Factor AND Citations Per Year
+#     Missing values imputed with mean of all papers
+#     Quality_Score (1–3)
+#
+#   COMPOSITE BENCHMARK FLAG (matrix combination)
+#
+# ============================================================================
+
+```{r libraries}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(glue)
+library(readr)
+library(writexl)
+library(ellmer)
+library(DT)
+```
+
+# ============================================================================
+# PART 1: CONFIGURATION
+# ============================================================================
+
+```{r config}
+# ----- API Configuration -----
+openai_api_key <- Sys.getenv("NBS_API_KEY")
+GPT_MODEL <- "gpt-5-nano"
+
+# ----- Paths -----
+FULLTEXT_RDS <- "C:/PDFs_extracted_text/nbs_articles_with_text_PRE_GPT.rds"
+FULLTEXT_DIR <- "C:/PDFs_extracted_text/FullText_TXT"
+EXTRACTION_FILE <- "C:/PDFs_extracted_text/extraction_results/nbs_extraction_results_66.rds"
+OPENALEX_DIR <- "C:/Users/mlolita/OneDrive - CGIAR/Alliance - ClimateActionNetZero - 1_Projects/D591_Rural-Scan_NBS/2_Technical_&_Data/Stocktake Review/Open Alex search/outputs_with_abstracts/"
+
+OUT_DIR <- "C:/PDFs_extracted_text/extraction_results"
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+MAX_CHARS <- 120000
+
+# ----- Helper Functions -----
+`%||%` <- function(a, b) if (!is.null(a) && !is.na(a) && nzchar(a)) a else b
+
+safe_stem <- function(x) {
+  x %>%
+    tools::file_path_sans_ext() %>%
+    str_replace_all("[^A-Za-z0-9]+", "_") %>%
+    str_replace_all("_+", "_") %>%
+    str_replace_all("^_|_$", "")
+}
+
+load_txt_file <- function(file_name, txt_dir = FULLTEXT_DIR) {
+  txt_name <- paste0(safe_stem(file_name), ".txt")
+  txt_path <- file.path(txt_dir, txt_name)
+  if (file.exists(txt_path)) {
+    tryCatch({
+      txt <- readLines(txt_path, warn = FALSE, encoding = "UTF-8")
+      paste(txt, collapse = "\n")
+    }, error = function(e) NA_character_)
+  } else {
+    NA_character_
+  }
+}
+
+clip_text <- function(x, max_chars = MAX_CHARS) {
+  sapply(x, function(txt) {
+    if (is.na(txt) || !nzchar(txt) || nchar(txt) <= max_chars) return(txt)
+    head_chars <- round(max_chars * 0.7)
+    tail_chars <- round(max_chars * 0.3)
+    head_part <- substr(txt, 1, head_chars)
+    tail_part <- substr(txt, nchar(txt) - tail_chars + 1, nchar(txt))
+    paste0(head_part, "\n\n[... MIDDLE TRUNCATED ...]\n\n", tail_part)
+  }, USE.NAMES = FALSE)
+}
+
+safe_chat <- function(prompt, model = GPT_MODEL) {
+  tryCatch({
+    chat <- ellmer::chat_openai(model = model)
+    resp <- chat$chat(prompt)
+    list(response = trimws(resp), error = NA_character_)
+  }, error = function(e) {
+    list(response = NA_character_, error = conditionMessage(e))
+  })
+}
+
+# Parse GPT response: "justification text; SCORE"
+parse_score_response <- function(response_text) {
+  if (is.na(response_text) || !nzchar(response_text)) {
+    return(list(score = NA_integer_, justification = NA_character_))
+  }
+  
+  last_semicolon <- regexpr(";[^;]*$", response_text)
+  
+  if (last_semicolon > 0) {
+    justification <- trimws(substr(response_text, 1, last_semicolon - 1))
+    score_part <- trimws(substr(response_text, last_semicolon + 1, nchar(response_text)))
+  } else {
+    justification <- response_text
+    score_part <- response_text
+  }
+  
+  score_match <- str_extract(score_part, "[123]")
+  score <- if (!is.na(score_match)) as.integer(score_match) else NA_integer_
+  
+  if (is.na(justification) || nchar(justification) == 0) {
+    justification <- NA_character_
+  }
+  
+  list(score = score, justification = justification)
+}
+```
+
+# ============================================================================
+# PART 2: LOAD DATA
+# ============================================================================
+
+```{r load_data}
+# Load extraction results
+if (file.exists(EXTRACTION_FILE)) {
+  extraction_df <- readRDS(EXTRACTION_FILE)
+  message(glue("Loaded {nrow(extraction_df)} extracted papers"))
+} else {
+  stop(glue("Extraction file not found: {EXTRACTION_FILE}"))
+}
+
+# Load and clip full text
+extraction_df <- extraction_df %>%
+  mutate(
+    Full_Text = map_chr(File, load_txt_file),
+    Text_For_Scoring = clip_text(Full_Text, MAX_CHARS)
+  )
+
+papers_to_score <- extraction_df %>%
+  filter(!is.na(Text_For_Scoring), nchar(Text_For_Scoring) > 500) 
+
+message(glue("Papers ready for benchmarking: {nrow(papers_to_score)}"))
+```
+
+# ============================================================================
+# PART 3: SCALABILITY PROMPTS (think first, score last)
+# ============================================================================
+
+```{r prompts}
+# -------------------------------------------------------------------------
+# CRITERION A: Geographic Scope of Application
+# -------------------------------------------------------------------------
+prompt_scalability_A <- function(txt) {
+  glue('
+Read the following FULL TEXT of a peer-reviewed paper on Nature-based Solutions spatial prioritisation.
+
+TASK: Determine the geographic scope at which the spatial analysis was APPLIED (not just discussed or reviewed).
+
+SCORING RULES:
+  1 = Local or sub-national: single site, farm, small watershed, municipality, province, district, single river basin, or sub-national region
+  2 = National: analysis covers one entire country, or a very large sub-national area approaching country scale
+  3 = Multi-country, continental, or global: analysis covers multiple countries, a full continent, or worldwide
+
+IMPORTANT:
+- Score based on where the METHOD WAS APPLIED, not where the authors say it could be applied
+- If the paper applies the method at multiple scales, score the LARGEST scale demonstrated
+- A paper that develops a global dataset but only tests it locally scores 1
+
+RESPONSE FORMAT:
+First, write your reasoning in 1-2 sentences naming the specific geography and explaining your score choice. Then write a semicolon (;) followed by ONLY the score digit (1, 2, or 3).
+
+Example: The study applied a weighted overlay analysis across three districts in northern Ethiopia, which is a sub-national extent; 1
+
+TEXT:
+"""
+{txt}
+"""')
+}
+
+# -------------------------------------------------------------------------
+# CRITERION B: Method Transferability
+# -------------------------------------------------------------------------
+prompt_scalability_B <- function(txt) {
+  glue('
+Read the following FULL TEXT of a peer-reviewed paper on Nature-based Solutions spatial prioritisation.
+
+TASK: Assess how TRANSFERABLE the spatial method is to other regions without repeating the full study.
+
+SCORING RULES:
+  1 = NOT transferable without major effort: method depends on locally calibrated models, local expert or stakeholder workshops for weights, participatory mapping, community-specific training data, or site-specific field calibration that cannot be reused elsewhere. Examples: local AHP with community-derived weights, ML trained exclusively on local field plots with no global features, purely participatory GIS exercises.
+  2 = MODERATELY transferable: the analytical framework is standard and documented but requires local adaptation such as re-assigning weights, regional retraining of a model, or local parameter tuning. The method structure could be replicated but key parameters are context-specific. Examples: MCDA with transferable criteria but expert-assigned weights; ML model using some global covariates but trained on local response data; process-based model needing regional calibration.
+  3 = HIGHLY transferable: method uses a generalizable, rule-based, or globally parameterized approach that can be applied anywhere with minimal adaptation. Examples: global threshold rules applied uniformly; open-source tool with published default parameters; simple GIS overlay using only global datasets and documented thresholds; global species distribution model with global predictors; published index with fixed formula.
+
+IMPORTANT:
+- Focus on the METHOD itself, not the data 
+- A method that uses global data but requires local expert weighting still scores 2, not 3
+- A method published with reproducible code/tool and fixed parameters scores higher
+- Consider whether someone in a different country could apply this method from the paper alone
+
+RESPONSE FORMAT:
+First, write your reasoning in 1-2 sentences explaining what makes the method transferable or not. Then write a semicolon (;) followed by ONLY the score digit (1, 2, or 3).
+
+Example: The method uses an AHP framework with criteria weights derived from a local stakeholder workshop in Senegal, meaning the weights would need to be re-derived for any new region; 1
+
+TEXT:
+"""
+{txt}
+"""')
+}
+
+# -------------------------------------------------------------------------
+# CRITERION C: Data Input Generalizability
+# -------------------------------------------------------------------------
+prompt_scalability_C <- function(txt) {
+  glue('
+Read the following FULL TEXT of a peer-reviewed paper on Nature-based Solutions spatial prioritisation.
+
+TASK: Assess how GENERALIZABLE the input datasets are — could someone replicate this analysis in a different region using the same or equivalent data?
+
+SCORING RULES:
+  1 = PRIMARILY LOCAL/PROPRIETARY: the analysis depends mainly on datasets that are not openly available or reproducible elsewhere. Examples: field survey data, local soil sampling campaigns, non-public government inventories, project-specific drone/UAV imagery, local farm census, proprietary commercial data, locally digitized maps.
+  2 = MIXED: the analysis uses a combination of globally available open-access datasets AND locally sourced data that would need to be collected or substituted in a new region. Examples: global climate + DEM layers combined with local land use surveys, national statistics not available globally, or local vegetation plots.
+  3 = PRIMARILY GLOBAL/OPEN-ACCESS: the analysis relies mainly on datasets that are globally available and openly accessible. Examples: WorldClim, CHIRPS, ERA5, CRU, SRTM, ALOS, Copernicus DEM, ESA WorldCover, GlobCover, MODIS products, Sentinel imagery, SoilGrids, iSDA, ISRIC, JRC datasets (Global Surface Water, Forest, etc.), GHS population, VIIRS nightlights, OpenStreetMap, GADM boundaries, WDPA protected areas, Global Aridity Index. Minor use of one local validation layer still qualifies as 3 if the bulk of the analytical inputs are global.
+
+IMPORTANT:
+- Read the methods and data sections carefully for ALL data sources mentioned
+- National datasets that are open and well-documented (e.g. USGS, national DEMs) count as accessible but still national-scope — score 2 unless they have global equivalents
+- If data sources are not named or described, that suggests lower generalizability
+
+RESPONSE FORMAT:
+First, write your reasoning in 1-2 sentences listing the key data sources found and explaining your score. Then write a semicolon (;) followed by ONLY the score digit (1, 2, or 3).
+
+Example: The study uses WorldClim bioclimatic variables, SRTM elevation, and ESA WorldCover as its main inputs, all of which are globally available, with only a small local soil survey for validation; 3
+
+TEXT:
+"""
+{txt}
+"""')
+}
+```
+
+# ============================================================================
+# PART 4: RUN SCALABILITY SCORING
+# ============================================================================
+
+```{r run_scoring, eval=FALSE}
+n <- nrow(papers_to_score)
+
+# Pre-allocate
+score_A <- integer(n)
+score_B <- integer(n)
+score_C <- integer(n)
+justification_A <- character(n)
+justification_B <- character(n)
+justification_C <- character(n)
+
+pb <- txtProgressBar(min = 0, max = n, style = 3)
+
+for (i in seq_len(n)) {
+  txt <- papers_to_score$Text_For_Scoring[i]
+
+  # --- A: Geographic Scope ---
+  resp_A <- safe_chat(prompt_scalability_A(txt))
+  parsed_A <- parse_score_response(resp_A$response)
+  score_A[i] <- parsed_A$score
+  justification_A[i] <- parsed_A$justification
+  Sys.sleep(0.3)
+
+  # --- B: Method Transferability ---
+  resp_B <- safe_chat(prompt_scalability_B(txt))
+  parsed_B <- parse_score_response(resp_B$response)
+  score_B[i] <- parsed_B$score
+  justification_B[i] <- parsed_B$justification
+  Sys.sleep(0.3)
+
+  # --- C: Data Input Generalizability ---
+  resp_C <- safe_chat(prompt_scalability_C(txt))
+  parsed_C <- parse_score_response(resp_C$response)
+  score_C[i] <- parsed_C$score
+  justification_C[i] <- parsed_C$justification
+
+  setTxtProgressBar(pb, i)
+  Sys.sleep(0.3)
+}
+
+close(pb)
+
+# Attach scores
+papers_to_score$Scalability_A_Geographic    <- score_A
+papers_to_score$Scalability_A_Justification <- justification_A
+papers_to_score$Scalability_B_Method        <- score_B
+papers_to_score$Scalability_B_Justification <- justification_B
+papers_to_score$Scalability_C_Data          <- score_C
+papers_to_score$Scalability_C_Justification <- justification_C
+
+# Scalability Score = median(A, B, C)
+papers_to_score$Scalability_Score <- apply(
+  papers_to_score[, c("Scalability_A_Geographic",
+                       "Scalability_B_Method",
+                       "Scalability_C_Data")],
+  1,
+  function(row) {
+    vals <- na.omit(row)
+    if (length(vals) == 0) return(NA_integer_)
+    as.integer(round(median(vals)))
+  }
+)
+
+# Join scores back to extraction_df
+score_cols <- c("File",
+                "Scalability_A_Geographic", "Scalability_A_Justification",
+                "Scalability_B_Method", "Scalability_B_Justification",
+                "Scalability_C_Data", "Scalability_C_Justification",
+                "Scalability_Score")
+
+extraction_df <- extraction_df %>%
+  select(-any_of(score_cols[-1])) %>%
+  left_join(papers_to_score %>% select(all_of(score_cols)), by = "File")
+
+message("\n✓ Scalability scoring complete!")
+
+extraction_df2 <- extraction_df %>%
+  select("File", "NbS_Practice", "NbS_Cluster", "Extract_Status", "Pages",
+         "NbS_Subpractice", "Input_Variables", "Analysis_Resolution",
+         "Spatial_Method", "Method_Validation", "Tool", "Tool_Source",
+         "Output", "Climate_Barrier", "Climate_Benefit", "Economics",
+         "Geographic_Scope", "Narrative", "Code_Data_Availability",
+         "Contacts_Email", "Extractor",
+         "Scalability_A_Geographic", "Scalability_A_Justification",
+         "Scalability_B_Method", "Scalability_B_Justification",
+         "Scalability_C_Data", "Scalability_C_Justification",
+         "Scalability_Score")
+
+write.csv(extraction_df2, file.path(OUT_DIR, "nbs_scalability_benchmark.csv"))
+```
+
+# ============================================================================
+# PART 5: EVIDENCE QUALITY — OPENALEX MATCHING + SCORING
+# ============================================================================
+
+```{r quality_match}
+extraction_df <- read.csv("C:/PDFs_extracted_text/extraction_results/nbs_scalability_benchmark.csv")
+
+# --- Step 1: Load & combine all OpenAlex CSVs ---
+openalex_files <- list.files(OPENALEX_DIR, pattern = "\\.csv$", full.names = TRUE)
+message(glue("Found {length(openalex_files)} OpenAlex CSV files"))
+
+openalex_all <- openalex_files %>%
+  purrr::map_dfr(function(f) {
+    df <- read.csv(f, stringsAsFactors = FALSE)
+    tibble(
+      title                 = as.character(df[["title"]]),
+      doi_clean             = as.character(df[["doi_clean"]]),
+      cited_by_count        = as.numeric(df[["cited_by_count"]]),
+      journal_name          = as.character(df[["journal_name"]]),
+      journal_impact_factor = as.numeric(df[["journal_impact_factor"]]),
+      citations_per_year    = as.numeric(df[["citations_per_year"]])
+    )
+  }) %>%
+  filter(!is.na(doi_clean), nchar(doi_clean) > 0) %>%
+  mutate(doi_lower = str_to_lower(str_trim(doi_clean))) %>%
+  distinct(doi_lower, .keep_all = TRUE)
+
+message(glue("Loaded {nrow(openalex_all)} unique OpenAlex records"))
+
+# --- Step 2: Extract DOI from each paper's full text ---
+extract_doi <- function(txt) {
+  if (is.na(txt) || nchar(txt) < 10) return(NA_character_)
+  doi <- str_extract(txt, "10\\.\\d{4,9}/[^\\s\"'<>\\]\\)}{]+")
+  if (!is.na(doi)) str_remove(doi, "[.),;:]+$") else NA_character_
+}
+
+if (!"Full_Text" %in% names(extraction_df)) {
+  extraction_df <- extraction_df %>%
+    mutate(Full_Text = map_chr(File, load_txt_file))
+}
+
+extraction_df <- extraction_df %>%
+  mutate(
+    doi_extracted = map_chr(Full_Text, extract_doi),
+    doi_lower     = str_to_lower(str_trim(doi_extracted))
+  )
+
+message(glue("DOIs extracted from text: {sum(!is.na(extraction_df$doi_lower))} / {nrow(extraction_df)}"))
+
+# --- Step 3: Primary match on DOI ---
+extraction_df <- extraction_df %>%
+  left_join(
+    openalex_all %>% select(doi_lower, oa_title = title, cited_by_count,
+                             journal_name, journal_impact_factor, citations_per_year),
+    by = "doi_lower",
+    relationship = "many-to-one"
+  )
+
+matched_doi <- sum(!is.na(extraction_df$cited_by_count))
+message(glue("Matched by DOI: {matched_doi} / {nrow(extraction_df)}"))
+
+# --- Step 4: Fuzzy title fallback for unmatched ---
+clean_title <- function(x) {
+  x %>% str_to_lower() %>% str_remove_all("[^a-z0-9 ]") %>% str_squish()
+}
+
+openalex_all <- openalex_all %>%
+  mutate(title_clean = clean_title(title))
+
+extract_title_from_file <- function(f) {
+  f %>%
+    tools::file_path_sans_ext() %>%
+    str_remove("^.*\\d{4}\\s*-\\s*") %>%
+    str_remove_all("[^A-Za-z0-9 ]") %>%
+    str_squish() %>%
+    str_to_lower()
+}
+
+unmatched_idx <- which(is.na(extraction_df$cited_by_count))
+message(glue("Attempting fuzzy title match on {length(unmatched_idx)} unmatched papers..."))
+
+if (length(unmatched_idx) > 0) {
+  extraction_df$title_from_file <- extract_title_from_file(extraction_df$File)
+  
+  for (i in unmatched_idx) {
+    tf <- extraction_df$title_from_file[i]
+    if (is.na(tf) || nchar(tf) < 5) next
+    
+    hits <- which(
+      str_detect(openalex_all$title_clean, fixed(tf)) |
+        str_detect(tf, fixed(openalex_all$title_clean))
+    )
+    
+    if (length(hits) >= 1) {
+      match_row <- openalex_all[hits[1], ]
+      extraction_df$oa_title[i]               <- match_row$title
+      extraction_df$cited_by_count[i]         <- match_row$cited_by_count
+      extraction_df$journal_name[i]           <- match_row$journal_name
+      extraction_df$journal_impact_factor[i]  <- match_row$journal_impact_factor
+      extraction_df$citations_per_year[i]     <- match_row$citations_per_year
+    }
+  }
+}
+
+matched_total <- sum(!is.na(extraction_df$cited_by_count))
+message(glue("\n=== OPENALEX MATCHING SUMMARY ==="))
+message(glue("Total papers: {nrow(extraction_df)}"))
+message(glue("Matched by DOI: {matched_doi}"))
+message(glue("Matched by title (fallback): {matched_total - matched_doi}"))
+message(glue("Total matched: {matched_total} / {nrow(extraction_df)}"))
+message(glue("Unmatched: {nrow(extraction_df) - matched_total}"))
+```
+
+```{r quality_scoring}
+# ============================================================================
+# EVIDENCE QUALITY SCORING
+# ============================================================================
+#
+# UPDATED METHODOLOGY:
+#   - Uses Citations Per Year instead of total citations
+#   - Missing values (IF or citations_per_year) are IMPUTED with the mean
+#
+# SCORING RULES:
+#   1 = Journal IF < 2 AND citations_per_year < 3
+#   2 = Journal IF >= 2 OR citations_per_year >= 3 (either condition met)
+#   3 = Journal IF > 5 AND citations_per_year >= 5 (both conditions met)
+#
+# ============================================================================
+
+# --- Step 1: Calculate means for imputation (from non-missing values) ---
+mean_IF <- mean(extraction_df$journal_impact_factor, na.rm = TRUE)
+mean_cpy <- mean(extraction_df$citations_per_year, na.rm = TRUE)
+
+cat("\n=== IMPUTATION VALUES ===\n")
+cat(glue("Mean Impact Factor (for imputation): {round(mean_IF, 2)}\n"))
+cat(glue("Mean Citations Per Year (for imputation): {round(mean_cpy, 2)}\n"))
+
+# Count how many will be imputed
+n_missing_IF <- sum(is.na(extraction_df$journal_impact_factor))
+n_missing_cpy <- sum(is.na(extraction_df$citations_per_year))
+cat(glue("\nPapers missing Impact Factor: {n_missing_IF} / {nrow(extraction_df)}\n"))
+cat(glue("Papers missing Citations Per Year: {n_missing_cpy} / {nrow(extraction_df)}\n"))
+
+# --- Step 2: Impute missing values with mean ---
+extraction_df <- extraction_df %>%
+  mutate(
+    # Store original values for reference
+    IF_original  = journal_impact_factor,
+    CPY_original = citations_per_year,
+    
+    # Flag imputed values
+    IF_imputed  = is.na(journal_impact_factor),
+    CPY_imputed = is.na(citations_per_year),
+    
+    # Impute with mean
+    IF_value  = if_else(is.na(journal_impact_factor), mean_IF, journal_impact_factor),
+    CPY_value = if_else(is.na(citations_per_year), mean_cpy, citations_per_year)
+  )
+
+# --- Step 3: Calculate Quality Score using citations per year ---
+extraction_df <- extraction_df %>%
+  mutate(
+    Quality_Score = case_when(
+      # Score 3: IF > 5 AND citations_per_year >= 5 (both conditions)
+      IF_value > 5 & CPY_value >= 5   ~ 3L,
+      # Score 2: IF >= 2 OR citations_per_year >= 3 (either condition)
+      IF_value >= 2 | CPY_value >= 3  ~ 2L,
+      # Score 1: IF < 2 AND citations_per_year < 3 (neither condition)
+      TRUE                            ~ 1L
+    )
+  )
+
+# --- Quality diagnostics ---
+cat("\n=== EVIDENCE QUALITY SCORE DISTRIBUTION ===\n")
+print(table(extraction_df$Quality_Score, useNA = "ifany"))
+
+cat("\n=== RAW BIBLIOMETRIC SUMMARY (before imputation) ===\n")
+cat(glue("Impact Factor: median = {round(median(extraction_df$IF_original, na.rm=TRUE), 2)}, ",
+         "mean = {round(mean(extraction_df$IF_original, na.rm=TRUE), 2)}, ",
+         "range = {round(min(extraction_df$IF_original, na.rm=TRUE), 2)}",
+         "–{round(max(extraction_df$IF_original, na.rm=TRUE), 2)}\n"))
+cat(glue("Citations Per Year: median = {round(median(extraction_df$CPY_original, na.rm=TRUE), 2)}, ",
+         "mean = {round(mean(extraction_df$CPY_original, na.rm=TRUE), 2)}, ",
+         "range = {round(min(extraction_df$CPY_original, na.rm=TRUE), 2)}",
+         "–{round(max(extraction_df$CPY_original, na.rm=TRUE), 2)}\n"))
+
+cat("\n=== IMPUTATION SUMMARY ===\n")
+cat(glue("Papers with imputed IF: {sum(extraction_df$IF_imputed)}\n"))
+cat(glue("Papers with imputed Citations Per Year: {sum(extraction_df$CPY_imputed)}\n"))
+cat(glue("Papers with any imputation: {sum(extraction_df$IF_imputed | extraction_df$CPY_imputed)}\n"))
+
+# Show score distribution by imputation status
+cat("\n=== QUALITY SCORE BY IMPUTATION STATUS ===\n")
+extraction_df %>%
+  mutate(Imputation_Status = case_when(
+    IF_imputed & CPY_imputed ~ "Both imputed",
+    IF_imputed ~ "IF imputed only",
+    CPY_imputed ~ "CPY imputed only",
+    TRUE ~ "No imputation"
+  )) %>%
+  count(Imputation_Status, Quality_Score) %>%
+  pivot_wider(names_from = Quality_Score, values_from = n, values_fill = 0) %>%
+  print()
+```
+
+# ============================================================================
+# PART 6: COMPOSITE BENCHMARK
+# ============================================================================
+
+```{r composite_benchmark}
+# ============================================================================
+# COMPOSITE BENCHMARK FLAG
+# ============================================================================
+#
+# Matrix:
+#                  Quality=1   Quality=2   Quality=3
+# Scalability=1     Low         Low         Low
+# Scalability=2     Low         Medium      High
+# Scalability=3     Low         High        High
+#
+# ============================================================================
+
+extraction_df <- extraction_df %>%
+  mutate(
+    Final_Benchmark = case_when(
+      is.na(Scalability_Score) | is.na(Quality_Score)         ~ "Unscored",
+      # Low: either dimension is 1
+      Scalability_Score == 1 | Quality_Score == 1             ~ "Low",
+      # Medium: both are exactly 2
+      Scalability_Score == 2 & Quality_Score == 2             ~ "Medium",
+      # High: Scalability >= 2 AND Quality >= 2 (and not both exactly 2)
+      Scalability_Score >= 2 & Quality_Score >= 2             ~ "High",
+      # Fallback
+      TRUE                                                    ~ "Low"
+    ),
+    
+    # Numeric combined score for ranking
+    Combined_Score = case_when(
+      is.na(Scalability_Score) | is.na(Quality_Score) ~ NA_real_,
+      TRUE ~ (as.numeric(Scalability_Score) + as.numeric(Quality_Score)) / 2
+    )
+  )
+
+cat("\n=== FINAL BENCHMARK DISTRIBUTION ===\n")
+print(table(extraction_df$Final_Benchmark, useNA = "ifany"))
+```
+
+# ============================================================================
+# PART 7: SUMMARIES & DIAGNOSTICS
+# ============================================================================
+
+```{r summaries}
+# --- Overall distributions ---
+cat("\n=== SCALABILITY SUB-SCORE DISTRIBUTIONS ===\n")
+cat("\nA. Geographic Scope:\n")
+print(table(extraction_df$Scalability_A_Geographic, useNA = "ifany"))
+cat("\nB. Method Transferability:\n")
+print(table(extraction_df$Scalability_B_Method, useNA = "ifany"))
+cat("\nC. Data Input Generalizability:\n")
+print(table(extraction_df$Scalability_C_Data, useNA = "ifany"))
+cat("\nScalability Score (median):\n")
+print(table(extraction_df$Scalability_Score, useNA = "ifany"))
+
+cat("\n=== EVIDENCE QUALITY SCORE ===\n")
+print(table(extraction_df$Quality_Score, useNA = "ifany"))
+
+cat("\n=== FINAL BENCHMARK FLAG ===\n")
+print(table(extraction_df$Final_Benchmark, useNA = "ifany"))
+
+# --- Cross-tabulation: Scalability × Quality ---
+cat("\n=== SCALABILITY × QUALITY CROSS-TABLE ===\n")
+print(table(
+  Scalability = extraction_df$Scalability_Score,
+  Quality = extraction_df$Quality_Score,
+  useNA = "ifany"
+))
+
+# --- By NbS Practice ---
+cat("\n=== BENCHMARK BY NbS PRACTICE ===\n")
+extraction_df %>%
+  group_by(NbS_Practice) %>%
+  summarise(
+    n = n(),
+    mean_scalability = round(mean(Scalability_Score, na.rm = TRUE), 1),
+    mean_quality     = round(mean(Quality_Score, na.rm = TRUE), 1),
+    mean_combined    = round(mean(Combined_Score, na.rm = TRUE), 1),
+    median_IF        = round(median(IF_value, na.rm = TRUE), 1),
+    median_CPY       = round(median(CPY_value, na.rm = TRUE), 1),
+    n_imputed        = sum(IF_imputed | CPY_imputed),
+    n_high           = sum(Final_Benchmark == "High", na.rm = TRUE),
+    n_medium         = sum(Final_Benchmark == "Medium", na.rm = TRUE),
+    n_low            = sum(Final_Benchmark == "Low", na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_combined)) %>%
+  print(n = 30)
+
+# --- By NbS Cluster ---
+cat("\n=== BENCHMARK BY NbS CLUSTER ===\n")
+extraction_df %>%
+  group_by(NbS_Cluster) %>%
+  summarise(
+    n = n(),
+    mean_combined = round(mean(Combined_Score, na.rm = TRUE), 1),
+    pct_high      = round(100 * mean(Final_Benchmark == "High", na.rm = TRUE), 0),
+    pct_medium    = round(100 * mean(Final_Benchmark == "Medium", na.rm = TRUE), 0),
+    pct_low       = round(100 * mean(Final_Benchmark == "Low", na.rm = TRUE), 0),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_combined)) %>%
+  print()
+
+# --- Top 20 papers ---
+cat("\n=== TOP 20 PAPERS BY COMBINED SCORE ===\n")
+extraction_df %>%
+  filter(!is.na(Combined_Score)) %>%
+  arrange(desc(Combined_Score), desc(CPY_value)) %>%
+  select(File, NbS_Practice, Scalability_Score, Quality_Score,
+         Combined_Score, Final_Benchmark, IF_value, CPY_value,
+         IF_imputed, CPY_imputed) %>%
+  head(20) %>%
+  print()
+
+# --- Papers with imputed values ---
+cat("\n=== PAPERS WITH IMPUTED BIBLIOMETRIC DATA ===\n")
+extraction_df %>%
+  filter(IF_imputed | CPY_imputed) %>%
+  select(File, NbS_Practice, IF_imputed, CPY_imputed, 
+         IF_value, CPY_value, Quality_Score) %>%
+  print(n = 50)
+```
+
+# ============================================================================
+# PART 8: SAVE RESULTS
+# ============================================================================
+
+```{r save_final, eval=FALSE}
+# Clean up temporary columns but keep imputation flags
+extraction_final <- extraction_df %>%
+  select(-any_of(c("Full_Text", "Text_For_Scoring", "doi_lower",
+                    "title_from_file")))
+
+saveRDS(extraction_final, file.path(OUT_DIR, "nbs_extraction_fully_benchmarked.rds"))
+write_excel_csv(extraction_final, file.path(OUT_DIR, "nbs_extraction_fully_benchmarked.csv"))
+write_xlsx(extraction_final, file.path(OUT_DIR, "nbs_extraction_fully_benchmarked.xlsx"))
+
+message(glue("\nFully benchmarked results saved to: {OUT_DIR}"))
+message("  - nbs_extraction_fully_benchmarked.rds")
+message("  - nbs_extraction_fully_benchmarked.csv")
+message("  - nbs_extraction_fully_benchmarked.xlsx")
+
+cat("\n=== FINAL COLUMNS ===\n")
+cat(paste(names(extraction_final), collapse = "\n"))
+```
+
+# ============================================================================
+# PART 9: INTERACTIVE PREVIEW
+# ============================================================================
+
+```{r preview_final, eval=FALSE}
+DT::datatable(
+  extraction_df %>%
+    select(File, NbS_Practice, NbS_Cluster,
+           journal_name, IF_value, CPY_value, IF_imputed, CPY_imputed,
+           Quality_Score,
+           Scalability_A_Geographic, Scalability_A_Justification,
+           Scalability_B_Method, Scalability_B_Justification,
+           Scalability_C_Data, Scalability_C_Justification,
+           Scalability_Score, Combined_Score, Final_Benchmark) %>%
+    mutate(across(where(is.character), ~ifelse(
+      nchar(.) > 80, paste0(substr(., 1, 80), "..."), .
+    ))),
+  options = list(pageLength = 15, scrollX = TRUE),
+  caption = "NbS Benchmarking — Scalability + Evidence Quality (with Citations Per Year)"
+)
+```
+
+# ============================================================================
+# PART 10: COST ESTIMATE
+# ============================================================================
+
+```{r cost}
+if (exists("papers_to_score")) {
+  n_papers <- nrow(papers_to_score)
+  total_calls <- n_papers * 3
+  avg_chars <- mean(nchar(papers_to_score$Text_For_Scoring), na.rm = TRUE)
+  avg_input_tokens <- avg_chars / 4
+  avg_output_tokens <- 80
+
+  input_cost <- (avg_input_tokens * total_calls / 1e6) * 0.15
+  output_cost <- (avg_output_tokens * total_calls / 1e6) * 0.60
+  total_cost <- input_cost + output_cost
+
+  cat(glue("\n=== BENCHMARKING COST ESTIMATE ===\n"))
+  cat(glue("Papers: {n_papers}\n"))
+  cat(glue("API calls: {total_calls} (3 per paper)\n"))
+  cat(glue("Avg input tokens per call: ~{round(avg_input_tokens)}\n"))
+  cat(glue("Estimated cost: ${round(total_cost, 2)}\n"))
+  cat("=================================\n")
+}
+```
+
+# ============================================================================
+# OPTIONAL: TEST ON SMALL SAMPLE
+# ============================================================================
+
+```{r test_sample, eval=FALSE}
+set.seed(42)
+
+test_sample <- papers_to_score %>%
+  group_by(NbS_Practice) %>%
+  slice_head(n = 3) %>%
+  ungroup()
+
+message(glue("Testing benchmarking on {nrow(test_sample)} papers..."))
+
+n_test <- nrow(test_sample)
+test_A <- integer(n_test); test_B <- integer(n_test); test_C <- integer(n_test)
+test_just_A <- character(n_test); test_just_B <- character(n_test); test_just_C <- character(n_test)
+
+for (i in seq_len(n_test)) {
+  txt <- test_sample$Text_For_Scoring[i]
+
+  resp_A <- safe_chat(prompt_scalability_A(txt))
+  parsed_A <- parse_score_response(resp_A$response)
+  test_A[i] <- parsed_A$score; test_just_A[i] <- parsed_A$justification
+
+  resp_B <- safe_chat(prompt_scalability_B(txt))
+  parsed_B <- parse_score_response(resp_B$response)
+  test_B[i] <- parsed_B$score; test_just_B[i] <- parsed_B$justification
+
+  resp_C <- safe_chat(prompt_scalability_C(txt))
+  parsed_C <- parse_score_response(resp_C$response)
+  test_C[i] <- parsed_C$score; test_just_C[i] <- parsed_C$justification
+
+  cat(glue("\n[{i}/{n_test}] {substr(test_sample$File[i], 1, 50)}: A={test_A[i]} B={test_B[i]} C={test_C[i]}"))
+  Sys.sleep(0.5)
+}
+
+test_sample$Scalability_A <- test_A; test_sample$Scalability_A_Just <- test_just_A
+test_sample$Scalability_B <- test_B; test_sample$Scalability_B_Just <- test_just_B
+test_sample$Scalability_C <- test_C; test_sample$Scalability_C_Just <- test_just_C
+test_sample$Scalability_Score <- apply(
+  test_sample[, c("Scalability_A", "Scalability_B", "Scalability_C")],
+  1, function(r) as.integer(round(median(na.omit(r))))
+)
+
+# Preview
+test_sample %>%
+  select(File, NbS_Practice,
+         Scalability_A, Scalability_A_Just,
+         Scalability_B, Scalability_B_Just,
+         Scalability_C, Scalability_C_Just,
+         Scalability_Score) %>%
+  print(n = 30)
+
+write_excel_csv(
+  test_sample %>% select(-Text_For_Scoring, -Full_Text),
+  file.path(OUT_DIR, "nbs_benchmarking_test_results.csv")
+)
+```
+
+# ============================================================================
+# METHODOLOGY NOTES
+# ============================================================================
+
+## Evidence Quality Scoring Changes
+
+### Previous Method (Total Citations)
+- Used total citation count
+- Papers with missing data scored 1 (lowest)
+
+### Updated Method (Citations Per Year + Imputation)
+
+**Scoring Rules:**
+| Condition | Score |
+|-----------|-------|
+| IF > 5 AND CPY >= 5 | 3 (High) |
+| IF >= 2 OR CPY >= 3 | 2 (Medium) |
+| IF < 2 AND CPY < 3 | 1 (Low) |
+
+**Imputation:**
+- Missing Impact Factor → replaced with mean IF across all papers
+- Missing Citations Per Year → replaced with mean CPY across all papers
+- Imputation flags (`IF_imputed`, `CPY_imputed`) preserved for transparency
+
+### Rationale
+- Citations per year normalizes for paper age
+- Mean imputation ensures unmatched papers don't automatically score lowest
+- Imputation flags allow sensitivity analysis on imputed vs. observed values

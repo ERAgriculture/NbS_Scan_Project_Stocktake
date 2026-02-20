@@ -1,0 +1,1366 @@
+---
+title: "NbS Stocktake - AI Data Extraction from Peer-Reviewed Papers"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# ============================================================================
+# NbS STOCKTAKE - AUTOMATED DATA EXTRACTION PIPELINE
+# ============================================================================
+# 
+# WORKFLOW:
+#   PART 1: Setup & Configuration
+#   PART 2: Load pre-extracted text (from previous PDF extraction)
+#   PART 3: Define extraction prompts for each variable
+#   PART 4: GPT Extraction (variable by variable)
+#   PART 5: Save Results
+#
+# ============================================================================
+
+# Load libraries
+```{r libraries}
+library(pdftools)
+library(stringr)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(purrr)
+library(DT)
+library(glue)
+library(jsonlite)
+library(httr)
+library(readr)
+library(writexl)
+library(ellmer)
+```
+
+# ============================================================================
+# PART 1: CONFIGURATION
+# ============================================================================
+
+```{r config}
+# ----- API Configuration -----
+# Set your OpenAI API key (or use environment variable)
+
+openai_api_key <- Sys.getenv("NBS_API_KEY")
+
+# Model selection
+GPT_MODEL <- "gpt-5"  # Cost-effective option
+
+# ----- Extraction Configuration -----
+# Set to TRUE to use full text, FALSE to use methods section only
+USE_FULL_TEXT <- TRUE
+
+# Batch size for API calls
+CHUNK_SIZE <- 30
+
+# Maximum characters to send per paper (to avoid token limits)
+
+FULLTEXT_DIR <- "C:/PDFs_extracted_text/FullText_TXT"
+
+MAX_CHARS <- 120000
+
+# ----- Paths -----
+# Input: Pre-extracted text from Part 1 of your pipeline
+INPUT_RDS <- "C:/PDFs_extracted_text/nbs_articles_with_text_PRE_GPT.rds"
+
+# Output directory
+OUT_DIR <- "C:/PDFs_extracted_text/extraction_results"
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# ----- Helper Functions -----
+`%||%` <- function(a, b) if (!is.null(a) && !is.na(a) && nzchar(a)) a else b
+
+# Truncate text to max chars (keep beginning and end)
+clip_text <- function(x, max_chars = MAX_CHARS) {
+  sapply(x, function(txt) {
+    if (is.na(txt) || !nzchar(txt) || nchar(txt) <= max_chars) return(txt)
+    
+    # Keep 70% from beginning, 30% from end
+    head_chars <- round(max_chars * 0.7)
+    tail_chars <- round(max_chars * 0.3)
+    
+    head_part <- substr(txt, 1, head_chars)
+    tail_part <- substr(txt, nchar(txt) - tail_chars + 1, nchar(txt))
+    
+    paste0(head_part, "\n\n[... MIDDLE TRUNCATED ...]\n\n", tail_part)
+  }, USE.NAMES = FALSE)
+}
+
+# Safe API call wrapper
+safe_chat <- function(prompt, model = GPT_MODEL) {
+  tryCatch({
+    chat <- ellmer::chat_openai(model = model)
+    resp <- chat$chat(prompt)
+    list(response = trimws(resp), error = NA_character_)
+  }, error = function(e) {
+    list(response = NA_character_, error = conditionMessage(e))
+  })
+}
+
+# Add this BEFORE load_txt_file
+safe_stem <- function(x) {
+  x %>%
+    tools::file_path_sans_ext() %>%
+    str_replace_all("[^A-Za-z0-9]+", "_") %>%
+    str_replace_all("_+", "_") %>%
+    str_replace_all("^_|_$", "")
+}
+
+# Then load_txt_file will work
+load_txt_file <- function(file_name, txt_dir = FULLTEXT_DIR) {
+  txt_name <- paste0(safe_stem(file_name), ".txt")
+  txt_path <- file.path(txt_dir, txt_name)
+  
+  if (file.exists(txt_path)) {
+    tryCatch({
+      txt <- readLines(txt_path, warn = FALSE, encoding = "UTF-8")
+      paste(txt, collapse = "\n")
+    }, error = function(e) NA_character_)
+  } else {
+    NA_character_
+  }
+}
+```
+
+## What `safe_stem` does
+
+It converts a filename like:
+```
+"Baldwin et al. - 2022 - Geospatial Analysis.pdf"
+```
+Into:
+```
+"Baldwin_et_al_2022_Geospatial_Analysis"
+```
+
+# ============================================================================
+# PART 2: LOAD DATA
+# ============================================================================
+
+```{r load_data}
+# Load pre-extracted text
+if (file.exists(INPUT_RDS)) {
+  articles_tbl <- readRDS(INPUT_RDS)
+  message(glue("Loaded {nrow(articles_tbl)} articles"))
+} else {
+  stop(glue("Input file not found: {INPUT_RDS}"))
+}
+
+# Vectorized version of clip_text - RUN THIS FIRST
+clip_text <- function(x, max_chars = MAX_CHARS) {
+  sapply(x, function(txt) {
+    if (is.na(txt) || !nzchar(txt) || nchar(txt) <= max_chars) return(txt)
+    head_chars <- round(max_chars * 0.7)
+    tail_chars <- round(max_chars * 0.3)
+    head_part <- substr(txt, 1, head_chars)
+    tail_part <- substr(txt, nchar(txt) - tail_chars + 1, nchar(txt))
+    paste0(head_part, "\n...[TRUNCATED]...\n", tail_part)
+  }, USE.NAMES = FALSE)
+}
+
+# Select text column based on configuration
+articles_tbl <- articles_tbl %>%
+  mutate(
+    Full_Text = map_chr(File, load_txt_file),
+    Text_For_Extraction = clip_text(Full_Text, MAX_CHARS)
+  )
+# Filter to papers with extractable text
+
+
+```
+
+## ad citATIONA and impact factor 
+
+```{r}
+library(stringr)
+library(dplyr)
+library(purrr)
+library(glue)
+
+# ============================================================================
+# MATCH ARTICLES WITH OPENALEX DATA (citations, impact factor)
+# Strategy: Primary = DOI match from full text; Fallback = fuzzy title match
+# ============================================================================
+
+# --- Step 1: Load & combine all OpenAlex CSVs ---
+openalex_files <- list.files(
+  "C:/Users/mlolita/OneDrive - CGIAR/Alliance - ClimateActionNetZero - 1_Projects/D591_Rural-Scan_NBS/2_Technical_&_Data/Stocktake Review/Open Alex search/outputs_with_abstracts/",
+  pattern = "\\.csv$", 
+  full.names = TRUE
+)
+
+message(glue("Found {length(openalex_files)} OpenAlex CSV files"))
+
+openalex_all <- openalex_files %>%
+  purrr::map_dfr(function(f) {
+    df <- read.csv(f, stringsAsFactors = FALSE)
+    tibble(
+      title = as.character(df[["title"]]),
+      doi_clean = as.character(df[["doi_clean"]]),
+      cited_by_count = as.numeric(df[["cited_by_count"]]),
+      journal_name = as.character(df[["journal_name"]]),
+      journal_impact_factor = as.numeric(df[["journal_impact_factor"]]),
+      citations_per_year = as.numeric(df[["citations_per_year"]])
+    )
+  }) %>%
+  filter(!is.na(doi_clean), nchar(doi_clean) > 0) %>%
+  mutate(doi_lower = str_to_lower(str_trim(doi_clean))) %>%
+  distinct(doi_lower, .keep_all = TRUE)
+
+message(glue("Loaded {nrow(openalex_all)} unique OpenAlex records"))
+
+# --- Step 2: Extract DOI from each paper's full text ---
+extract_doi <- function(txt) {
+  if (is.na(txt) || nchar(txt) < 10) return(NA_character_)
+  doi <- str_extract(txt, "10\\.\\d{4,9}/[^\\s\"'<>\\]\\)}{]+")
+  if (!is.na(doi)) str_remove(doi, "[.),;:]+$") else NA_character_
+}
+
+articles_tbl <- articles_tbl %>%
+  mutate(
+    doi_extracted = map_chr(Full_Text, extract_doi),
+    doi_lower = str_to_lower(str_trim(doi_extracted))
+  )
+
+message(glue("DOIs extracted from text: {sum(!is.na(articles_tbl$doi_lower))} / {nrow(articles_tbl)}"))
+
+# --- Step 3: Join on DOI (primary match) ---
+articles_tbl <- articles_tbl %>%
+  left_join(
+    openalex_all %>% select(doi_lower, oa_title = title, cited_by_count, 
+                             journal_name, journal_impact_factor, citations_per_year),
+    by = "doi_lower"
+  )
+
+matched_doi <- sum(!is.na(articles_tbl$cited_by_count))
+message(glue("Matched by DOI: {matched_doi} / {nrow(articles_tbl)}"))
+
+# --- Step 4: Fuzzy title fallback for unmatched papers ---
+clean_title <- function(x) {
+  x %>%
+    str_to_lower() %>%
+    str_remove_all("[^a-z0-9 ]") %>%
+    str_squish()
+}
+
+# Prepare OpenAlex titles for fuzzy matching
+openalex_all <- openalex_all %>%
+  mutate(title_clean = clean_title(title))
+
+# Extract title from filename
+extract_title_from_file <- function(f) {
+  f %>%
+    tools::file_path_sans_ext() %>%
+    str_remove("^.*\\d{4}\\s*-\\s*") %>%
+    str_remove_all("[^A-Za-z0-9 ]") %>%
+    str_squish() %>%
+    str_to_lower()
+}
+
+# Only attempt fuzzy match on unmatched rows
+unmatched_idx <- which(is.na(articles_tbl$cited_by_count))
+message(glue("Attempting fuzzy title match on {length(unmatched_idx)} unmatched papers..."))
+
+if (length(unmatched_idx) > 0) {
+  articles_tbl$title_from_file <- extract_title_from_file(articles_tbl$File)
+  
+  for (i in unmatched_idx) {
+    tf <- articles_tbl$title_from_file[i]
+    if (is.na(tf) || nchar(tf) < 5) next
+    
+    # Substring matching: does OpenAlex title contain filename title or vice versa?
+    hits <- which(
+      str_detect(openalex_all$title_clean, fixed(tf)) |
+        str_detect(tf, fixed(openalex_all$title_clean))
+    )
+    
+    if (length(hits) >= 1) {
+      match <- openalex_all[hits[1], ]
+      articles_tbl$oa_title[i] <- match$title
+      articles_tbl$cited_by_count[i] <- match$cited_by_count
+      articles_tbl$journal_name[i] <- match$journal_name
+      articles_tbl$journal_impact_factor[i] <- match$journal_impact_factor
+      articles_tbl$citations_per_year[i] <- match$citations_per_year
+    }
+  }
+}
+
+# --- Step 5: Check results ---
+matched_total <- sum(!is.na(articles_tbl$cited_by_count))
+message(glue("\n=== MATCHING SUMMARY ==="))
+message(glue("Total papers: {nrow(articles_tbl)}"))
+message(glue("Matched by DOI: {matched_doi}"))
+message(glue("Matched by title (fallback): {matched_total - matched_doi}"))
+message(glue("Total matched: {matched_total} / {nrow(articles_tbl)}"))
+message(glue("Unmatched: {nrow(articles_tbl) - matched_total}"))
+
+papers_to_extract <- articles_tbl %>%
+  filter(!is.na(Text_For_Extraction), nchar(Text_For_Extraction) > 500)
+```
+
+
+
+# ============================================================================
+# PART 3: EXTRACTION PROMPTS
+# ============================================================================
+
+```{r prompts}
+# ============================================================================
+# PART 3: EXTRACTION PROMPTS - REVISED VERSION
+# ============================================================================
+
+# ----- Prompt: NbS Subpractice -----
+prompt_nbs_subpractice <- function(txt, nbs_practice) {
+  glue('
+Read the following text from a peer-reviewed paper on Nature-based Solutions.
+The paper is about: {nbs_practice}
+
+Identify if the paper specifies a more precise NbS subpractice beyond the general category.
+
+Examples of subpractices:
+- Agroforestry: FMNR, Multistrata systems, Alley cropping, Silvopasture, Parklands, Windbreaks, Riparian buffers, Home gardens, Forest farming, Shelterbelts
+- Forest restoration: Natural regeneration, Assisted natural regeneration, Active planting, Enrichment planting, Afforestation
+- Wetland management: Peatland restoration, Floodplain restoration, Mangrove restoration, Constructed wetlands
+- Water harvesting: Check dams, Contour bunds, Farm ponds, Terracing, Swales
+
+Extract the specific subpractice(s) as named in the paper.
+If multiple subpractices, separate with semicolons (;) with NO line breaks.
+If only the general NbS practice is mentioned without specific subpractices, return NA.
+
+TEXT:
+"""
+{txt}
+"""
+
+Output only the subpractice name(s) or NA on a single line. No explanation. No line breaks within the answer.')
+}
+
+# ----- Prompt: Input Variables -----
+prompt_input_variables <- function(txt) {
+  glue('
+Read the following text from a peer-reviewed paper on NbS spatial prioritisation.
+
+Extract input variables/data layers used in the spatial analysis or suitability model. Also extract the source of the variable. 
+
+
+IMPORTANT: 
+- Do NOT include the NbS practice itself (e.g., "agroforestry", "wetland restoration") as an input variable.
+- Only extract data layers used to DETERMINE suitability.
+- Only extract the variable name and its source in parenthesis do not extracts words like dataset or layer etc
+
+Format: Variable Name (Source); Variable Name (Source); ...
+
+CRITICAL: Output must be on a SINGLE LINE with semicolons separating items. NO line breaks within the output.
+
+If no input variables described, return NA.
+
+TEXT:
+"""
+{txt}
+"""
+
+Output only the variable list with categories or NA. Single line only. No explanation.')
+}
+
+
+# ----- Prompt: Spatial Method Name -----
+prompt_spatial_method <- function(txt) {
+  glue('
+Read the following text from a peer-reviewed paper on NbS spatial prioritisation.
+
+Explain the spatial analysis method(s) used to identify suitable/priority areas. Explain it in a short narrative sentence. Do not include the output but only the method itself.
+
+
+If multiple methods, separate with semicolons (;).
+CRITICAL: Output must be on a SINGLE LINE. NO line breaks.
+If method not described, state it.
+
+TEXT:
+"""
+{txt}
+""".')
+}
+
+
+# ----- Prompt: Method Validation -----
+prompt_method_validation <- function(txt, Spatial_Method) {
+  glue('
+Read the following text from a peer-reviewed paper on NbS spatial prioritisation.
+
+Spatial method used: {Spatial_Method}
+
+Identify if and how the authors VALIDATED their model outputs or suitability maps.
+
+Validation approaches include:
+- Field verification / ground-truthing (visited sites to confirm predictions)
+- Comparison with existing NbS sites or known locations
+- Cross-validation (k-fold, leave-one-out, train-test split)
+- Cross-evaluation with land use/land cover categories
+- Independent test dataset
+- Expert review or stakeholder validation
+- Sensitivity analysis
+- Comparison with other studies/maps
+- AHP consistency ratio check (CR < 0.1 threshold)
+- Proximity-based validation (proximity analysis to known features)
+
+Extract the validation approach(es) as described in the paper.
+If multiple approaches, separate with semicolons (;).
+CRITICAL: Output must be on a SINGLE LINE. NO line breaks.
+If no validation is mentioned or performed, return "Not adressed in paper"
+
+TEXT:
+"""
+{txt}
+"""
+
+Output only the validation method(s) or Not adressed in paper. Single line only. No explanation.')
+}
+
+
+# ----- Prompt: Analysis Resolution -----
+prompt_analysis_resolution <- function(txt) {
+  glue('
+Read the following text from a peer-reviewed paper on NbS spatial prioritisation.
+
+What spatial resolution or grid cell size was used for the ANALYSIS (not just input data)?
+
+Look for phrases like:
+- "analysis conducted at X resolution"
+- "resampled to X"
+- "grid spacing of X"
+- "cell size of X"
+- "aggregated to X km grid"
+- "vector grid spacing"
+
+Resolution formats:
+- Raster: 30m, 100m, 1km, 30 arc-seconds
+- Grid: 1km x 1km, 10km x 10km grid cells
+- Admin: county-level, district-level
+
+If multiple resolutions used for different analyses, list all.
+CRITICAL: Output on a SINGLE LINE. NO line breaks.
+If not explicitly stated, return NA.
+
+TEXT:
+"""
+{txt}
+"""
+
+Output only the analysis resolution or NA. Single line only. No explanation.')
+}
+
+# ----- Prompt: Tool -----
+prompt_tool <- function(txt) {
+  glue('
+Read the following text from a peer-reviewed paper on NbS spatial prioritisation.
+
+Identify any specifically named tools, software packages, platforms, or decision-support systems that perform the spatial analysis and generate analytical outputs or prioritisation results reported in the study. Then also extract the source of the tool (references/DOI/Github/URL).
+
+Only extract tools that:
+
+Are explicitly named
+Are designed for a specific analytical purpose
+Produce the study’s analytical outcomes (e.g. prioritisation, modelling, optimisation, assessment), not just data preparation or visualisation
+
+INCLUDE tools such as:
+
+Ecosystem service tools: InVEST, Co$ting Nature, WaterWorld, ARIES, LUCI
+Conservation planning tools: Marxan, Zonation, prioritizr, ConsNet
+Species or habitat modelling tools: MaxEnt, biomod2, ENMeval
+Carbon / climate assessment tools: COMET-Planner, COMET-Farm, CBP, Ex-Act
+Named decision-support systems: FADSS, targetCSA, LUMENS
+Custom or bespoke tools with a specific name (including web applications)
+
+EXCLUDE (do NOT extract):
+
+General GIS or mapping software (e.g. ArcGIS, QGIS, GRASS GIS, ArcGIS Pro)
+Commonly used spatial method names : Weighted overalay, random forest, Analytical hierarchy process (AHP)...
+Programming languages or environments (e.g. R, Python, MATLAB)
+Cloud platforms or processing environments (e.g. Google Earth Engine, unless a named app built on it)
+Data sources, datasets, or input variables (e.g. WorldClim, SoilGrids, FAO)
+Intermediate products, layers, indices, or maps generated by a tool
+Image processing or database software
+
+If multiple tools are identified, separate them with semicolons (;). Only extract the Tool name and nothing else. 
+
+CRITICAL FORMATTING RULES
+
+Output must be a single line
+No explanations
+No line breaks
+If no qualifying named analytical tool is mentioned, return NA
+
+Format : Tool name 1 (source) ; tool name 2 (Source)
+
+TEXT:
+"""
+{txt}
+"""
+
+Output only specific tool name(s) or NA. Single line only. No explanation.')
+}
+
+# ----- Prompt: Tool Source ----- [NEW PROMPT]
+prompt_tool_source <- function(txt, tool) {
+  glue('
+
+The following tool(s) were previously identified from this paper: {tool}
+
+For ONLY these tool(s) listed above — and NO others — explain the utility of each tool based on the text below.
+
+STRICT RULES:
+- Do NOT identify or describe any tools not in the list above
+- If the tool name above is NA, return NA
+- Only describe what these specific tools were used for in this study
+
+Format: tool name : description ; tool name : description
+
+TEXT:
+"""
+{txt}
+"""
+
+ Single line only.')
+}
+
+# ----- Prompt: Output -----
+prompt_output <- function(txt) {
+  glue('
+Read the following text from a peer-reviewed paper on NbS spatial prioritisation.
+
+Extract ONLY the FINAL DECISION-FACING GEOSPATIAL PRODUCTS of the analysis.
+
+DECISION RULE: For each map mentioned in the results, ask: "Does this map answer WHERE to implement NbS or HOW MUCH BENEFIT NbS provides?" If NO, exclude it.
+
+INCLUDE:
+- Suitability / priority / opportunity / allocation maps for NbS placement
+- Spatially-explicit NbS benefit maps (carbon sequestration, yield gain, flood risk reduction, biodiversity gain, economic return)
+
+EXCLUDE even if shown in results:
+- Any map of an environmental variable (slope, NDVI, soil, rainfall, temperature, runoff, drainage, tree cover, land cover, poverty, population, climate projections/anomalies, watershed boundaries, stream order, proximity layers)
+- Constraint or exclusion masks
+- Sub-scores or criterion layers
+
+RULES:
+- One suitability map with multiple classes = ONE item
+- 1–5 items MAX, semicolon-separated, SINGLE LINE
+- Short noun phrases with classes in brackets if stated
+- If nothing qualifies, return NA
+
+TEXT:
+"""
+{txt}
+"""
+
+Return only the semicolon-separated outcomes or NA.')
+
+}
+
+prompt_climate_barrier <- function(txt) {
+  glue('
+Read the following text from a peer-reviewed paper on NbS spatial prioritisation.
+
+QUESTION
+In their methods the authors explicitly treat climate hazards or climate change as a RISK or BARRIER that could limit the feasibility, performance, or long-term success of the proposed NbS in the output produced by the paper?
+
+Say YES only if climate hazards are considered in the method as threatening suitability, persistence, or effectiveness of the intervention and that they treat it in their method or outputs. Narrative statements are not enough, it should be part of the method or result section of the paper. It should be a core section and not just a vague mention. 
+
+FORMAT
+"Yes: [1–2 sentences explaining how climate hazards threaten NbS outcomes AND how the authors demonstrate this (e.g., scenario analysis, hazard overlay, future suitability comparison, risk screening)]."
+OR
+"No"
+
+RULES
+- Narrative only (no bullet points, no lists)
+- Mention the *approach* used to support the claim, not detailed methods or tools
+- Do NOT name software, models, or input datasets
+- SINGLE LINE ONLY, no line breaks
+
+TEXT:
+"""
+{txt}
+"""
+
+Output only Yes with narrative explanation, or No.')
+}
+
+
+prompt_climate_benefit <- function(txt) {
+  glue('
+Read the following text from a peer-reviewed paper on NbS spatial prioritisation.
+
+QUESTION
+In their method do the authors explicitly use climate hazards or climate change as a REASON to target areas where NbS provides adaptation or mitigation benefits?
+
+Say YES only if NbS is spatially targeted because it can reduce climate risks or deliver mitigation outcomes and that they treat it in their outputs or methods. Narrative statements are not enough, it should be in the method or result section of the paper and should be a core section not just a vague mention. 
+
+FORMAT
+"Yes: [1–2 sentences explaining how NbS addresses climate risks or mitigation goals AND how the authors demonstrate this (e.g., risk reduction mapping, avoided impact estimation, carbon benefit comparison, scenario-based prioritisation)]."
+OR
+"No"
+
+RULES
+- Narrative only; no lists of variables or scenarios
+- Focus on logic: problem → NbS → demonstrated benefit
+- Do NOT mention tools, software, or data sources
+- SINGLE LINE ONLY, no line breaks
+
+TEXT:
+"""
+{txt}
+"""
+
+Output only Yes with narrative explanation, or No.')
+}
+
+
+# ----- Prompt: Economics -----
+prompt_economics <- function(txt) {
+  glue('
+Read the following text from a peer-reviewed NbS spatial prioritisation paper.
+
+TASK:
+Determine whether the paper includes FINANCIAL or MONETARY economic evaluation in the analytical outputs (Methods or Results).
+
+STRICT DEFINITION:
+"Economic" here refers ONLY to financial/monetary metrics or cost-based optimisation.
+
+COUNT AS "YES" ONLY IF at least one of the following is explicitly implemented in Methods or Results:
+
+1) Monetary valuation or cost metrics:
+   - Implementation cost ($)
+   - Net Present Value (NPV)
+   - Return on Investment (ROI)
+   - Internal Rate of Return (IRR)
+   - Benefit–Cost Ratio (BCR)
+   - Cost-effectiveness ($ per unit outcome)
+   - Budget optimisation
+   - Marginal abatement cost curves
+   - Explicit cost surfaces or net benefit maps expressed in monetary terms
+
+2) An optimisation or decision rule that explicitly minimises cost or maximises net financial benefit.
+
+DO NOT COUNT AS "YES" under any circumstance:
+- Poverty maps
+- Livelihood targeting
+- Socioeconomic vulnerability layers
+- Proximity analysis with poverty
+- Social benefit framing without monetary valuation
+- Suitability layers containing socioeconomic variables
+- Any non-monetary social indicator
+
+If no explicit monetary or cost-based metric is implemented analytically in Methods or Results, output:
+
+No
+
+OUTPUT RULE:
+Single line only.
+If YES:
+"Yes: explain the financial method and metrics"
+If NO:
+"No"
+
+TEXT:
+"""
+{txt}
+"""')
+}
+
+
+
+# ----- Prompt: Geographic Scope -----
+prompt_geographic_scope <- function(txt) {
+  glue('
+Read the following text from a peer-reviewed paper on NbS spatial prioritisation.
+
+Identify the GEOGRAPHIC SCOPE of the analysis.
+
+Scale categories:
+- Local: site, farm, small watershed (<1000 km²), municipality, village
+- Sub-national: region, province, state, district, large watershed, river basin
+- National: entire country
+- Multi-country: transboundary region, multiple countries
+- Continental: entire continent or major portion
+- Global: worldwide
+
+Extract the specific COUNTRY LOCATION NAME(S) mentioned.
+
+Format: Scale category: Location name(s)
+Example: "Sub-national: Ethiopia"
+Example: "National: Kenya"
+Example: "Multi-country: South Asia;Kenya"
+Example: "Sub-national: Iceland"
+
+Include all geographic areas mentioned if analysis covers multiple scales.
+CRITICAL: Output on a SINGLE LINE. NO line breaks.
+If no geographic information, return NA.
+
+TEXT:
+"""
+{txt}
+"""
+
+Output only the geographic scope or NA. Single line only. No explanation.')
+}
+
+# ----- Prompt: Narrative -----
+prompt_narrative <- function(txt) {
+  glue('
+Read the following text from a peer-reviewed paper on NbS spatial prioritisation.
+
+Write a concise summary (maximum 150 words) describing the spatial prioritisation approach.
+
+Include these elements IN ORDER:
+1. The NbS practice(s) addressed
+2. Main input variables and data sources (list key ones with sources if mentioned)
+3. The spatial method used and how variables were combined
+4. Validation approach and key results (if any)
+5. Main outputs produced and their resolution
+6. Geographic scope (scale and location)
+7. Whether climate risk or economic considerations were included (briefly)
+
+Writing guidelines:
+- Use third person, past tense
+- Only include information EXPLICITLY stated in the text
+- Do not infer or assume information not present
+- Be specific: include numbers, percentages, method names, and resolutions where available
+- Do not include recommendations or implications
+- Write as a single flowing paragraph, no bullet points
+
+TEXT:
+"""
+{txt}
+"""
+
+Output only the narrative paragraph (max 150 words). No additional commentary.')
+}
+
+# ----- Prompt: Code/Data Availability ----- [NEW PROMPT]
+prompt_code_data_availability <- function(txt) {
+  glue('
+Read the following text from a peer-reviewed paper on NbS spatial prioritisation.
+
+Check for CODE and DATA availability statements.
+
+Look for:
+1. CODE REPOSITORIES:
+- GitHub links
+- GitLab links
+- Zenodo archives
+- Figshare
+- "Code available at..."
+- "Scripts provided in supplementary..."
+
+2. DATA REPOSITORIES:
+- Data DOIs
+- Dryad
+- Zenodo data
+- "Data available at..."
+- Supplementary data files
+
+3. AVAILABILITY STATEMENTS:
+- "Data/code available upon request"
+- "All data used are publicly available"
+- Specific data availability sections
+
+Format: 
+Code: [URL or description]; Data: [URL or description]
+
+If nothing found, return NA.
+CRITICAL: Output on a SINGLE LINE. NO line breaks.
+
+TEXT:
+"""
+{txt}
+"""
+
+Output only availability information or NA. Single line only. No explanation.')
+}
+
+prompt_contact <- function(txt) {
+  glue('
+Read the following text from a peer-reviewed paper on NbS spatial prioritisation.
+
+Extract the contacts email adresse for the paper. If more than one extract a list separated by semicolumns
+
+TEXT:
+"""
+{txt}
+"""
+Single line only. No explanation.')
+}
+```
+
+# ============================================================================
+# PART 4: EXTRACTION FUNCTIONS
+# ============================================================================
+
+```{r extraction_functions}
+# ----- Single variable extractor -----
+extract_single_variable <- function(papers_df, prompt_fn, var_name, 
+                                    depends_on = NULL, chunk_size = CHUNK_SIZE) {
+  
+  n_papers <- nrow(papers_df)
+  results <- vector("character", n_papers)
+  
+  pb <- txtProgressBar(min = 0, max = n_papers, style = 3)
+  
+  for (i in seq_len(n_papers)) {
+    txt <- papers_df$Text_For_Extraction[i]
+    
+    # Build prompt - handle dependencies
+    if (is.null(depends_on)) {
+      # Simple prompt with just text
+      if (var_name == "NbS_Subpractice") {
+        prompt <- prompt_fn(txt, papers_df$NbS_Practice[i] %||% "Unknown")
+      } else {
+        prompt <- prompt_fn(txt)
+      }
+    } else {
+      # Prompt depends on previously extracted variable
+      dep_value <- papers_df[[depends_on]][i] %||% "NA"
+      prompt <- prompt_fn(txt, dep_value)
+    }
+    
+    # Call API
+    resp <- safe_chat(prompt)
+    
+    if (!is.na(resp$error)) {
+      results[i] <- NA_character_
+      warning(glue("Error extracting {var_name} for paper {i}: {resp$error}"))
+    } else {
+      results[i] <- resp$response
+    }
+    
+    setTxtProgressBar(pb, i)
+    Sys.sleep(0.5)  # Rate limiting
+  }
+  
+  close(pb)
+  results
+}
+
+# ----- Batch variable extractor (for simple prompts) -----
+extract_batch_variable <- function(papers_df, prompt_fn, var_name, 
+                                   chunk_size = CHUNK_SIZE) {
+  
+  n_papers <- nrow(papers_df)
+  results <- vector("character", n_papers)
+  
+  idx <- seq_len(n_papers)
+  chunks <- split(idx, ceiling(idx / chunk_size))
+  
+  pb <- txtProgressBar(min = 0, max = length(chunks), style = 3)
+  
+  for (c in seq_along(chunks)) {
+    chunk_idx <- chunks[[c]]
+    
+    for (i in chunk_idx) {
+      txt <- papers_df$Text_For_Extraction[i]
+      
+      if (var_name == "NbS_Subpractice") {
+        prompt <- prompt_fn(txt, papers_df$NbS_Practice[i] %||% "Unknown")
+      } else {
+        prompt <- prompt_fn(txt)
+      }
+      
+      resp <- safe_chat(prompt)
+      results[i] <- if (!is.na(resp$error)) NA_character_ else resp$response
+      
+      Sys.sleep(0.3)
+    }
+    
+    setTxtProgressBar(pb, c)
+  }
+  
+  close(pb)
+  results
+}
+```
+
+# ============================================================================
+# PART 5: RUN EXTRACTION
+# ============================================================================
+
+```{r run_extraction, eval=FALSE}
+# ============================================================================
+# PART 5: SEQUENTIAL EXTRACTION WORKFLOW
+# ============================================================================
+# Updated to include: Input_Variable_Source, Analysis_Resolution,
+# Spatial_Method_Source, Tool_Source, Climate_Risk_Assessment, Economics
+# Removed: Method_Performance
+# ============================================================================
+
+# Initialize results dataframe with metadata
+extraction_results <- papers_to_extract %>%
+  select(
+    File, 
+    NbS_Practice, 
+    NbS_Cluster,
+    Extract_Status,
+    Pages,
+    citations_per_year,
+    journal_impact_factor
+  )
+
+# === NbS Subpractice (depends on nbs_practice passed into prompt fn) ===
+message("\n=== Extracting NbS Subpractice ===")
+extraction_results$NbS_Subpractice <- extract_single_variable(
+  papers_to_extract,
+  prompt_nbs_subpractice,
+  "NbS_Subpractice"
+)
+
+# === Input Variables ===
+message("\n=== Extracting Input Variables ===")
+extraction_results$Input_Variables <- extract_single_variable(
+  papers_to_extract,
+  prompt_input_variables,
+  "Input_Variables"
+)
+
+# (Optional) add Input_Variables back into df for downstream prompts if you later add dependencies
+papers_to_extract$Input_Variables <- extraction_results$Input_Variables
+
+# === Analysis Resolution ===
+message("\n=== Extracting Analysis Resolution ===")
+extraction_results$Analysis_Resolution <- extract_single_variable(
+  papers_to_extract,
+  prompt_analysis_resolution,
+  "Analysis_Resolution"
+)
+
+# === Spatial Method ===
+message("\n=== Extracting Spatial Method ===")
+extraction_results$Spatial_Method <- extract_single_variable(
+  papers_to_extract,
+  prompt_spatial_method,
+  "Spatial_Method"
+)
+
+# Add Spatial_Method to papers_to_extract for dependent prompts
+papers_to_extract$Spatial_Method <- extraction_results$Spatial_Method
+
+# === Method Validation (depends on Spatial_Method) ===
+message("\n=== Extracting Method Validation ===")
+extraction_results$Method_Validation <- extract_single_variable(
+  papers_to_extract,
+  prompt_method_validation,
+  "Method_Validation",
+  depends_on = "Spatial_Method"
+)
+
+# === Tool ===
+message("\n=== Extracting Tool ===")
+extraction_results$Tool <- extract_single_variable(
+  papers_to_extract,
+  prompt_tool,
+  "Tool"
+)
+
+# Add Tool to papers_to_extract for dependent prompts
+papers_to_extract$Tool <- extraction_results$Tool
+
+# === Tool Source (depends on Tool) ===
+message("\n=== Extracting Tool Source ===")
+extraction_results$Tool_Source <- extract_single_variable(
+  papers_to_extract,
+  prompt_tool_source,
+  "Tool_Source",
+  depends_on = "Tool"
+)
+
+# === Output (Final geospatial outcomes) ===
+message("\n=== Extracting Output ===")
+extraction_results$Output <- extract_single_variable(
+  papers_to_extract,
+  prompt_output,
+  "Output"
+)
+
+# Add Output to papers_to_extract for dependent prompts
+papers_to_extract$Output <- extraction_results$Output
+
+# === Climate: Hazard as Barrier to NbS success ===
+message("\n=== Extracting Climate Barrier ===")
+extraction_results$Climate_Barrier <- extract_single_variable(
+  papers_to_extract,
+  prompt_climate_barrier,
+  "Climate_Barrier"
+)
+
+# === Climate: Hazard as Adaptation/Mitigation Benefit Target ===
+message("\n=== Extracting Climate Benefit ===")
+extraction_results$Climate_Benefit <- extract_single_variable(
+  papers_to_extract,
+  prompt_climate_benefit,
+  "Climate_Benefit"
+)
+
+# === Economics (note: your prompt says "outputs", but dependency isn't required; keep depends_on if you want) ===
+message("\n=== Extracting Economics ===")
+extraction_results$Economics <- extract_single_variable(
+  papers_to_extract,
+  prompt_economics,
+  "Economics"
+  # depends_on = "Output"  # optional; only keep if your extract_single_variable enforces it
+)
+
+# === Geographic Scope ===
+message("\n=== Extracting Geographic Scope ===")
+extraction_results$Geographic_Scope <- extract_single_variable(
+  papers_to_extract,
+  prompt_geographic_scope,
+  "Geographic_Scope"
+)
+
+# === Narrative (150 words) ===
+message("\n=== Extracting Narrative ===")
+extraction_results$Narrative <- extract_single_variable(
+  papers_to_extract,
+  prompt_narrative,
+  "Narrative"
+)
+
+# === Code/Data Availability ===
+message("\n=== Extracting Code/Data Availability ===")
+extraction_results$Code_Data_Availability <- extract_single_variable(
+  papers_to_extract,
+  prompt_code_data_availability,
+  "Code_Data_Availability"
+)
+
+# === Contacts email addresses ===
+# IMPORTANT: you currently have TWO functions named prompt_code_data_availability.
+# Rename the second one to prompt_contacts_email in your prompt definitions,
+# then call it here:
+message("\n=== Extracting Contacts Emails ===")
+extraction_results$Contacts_Email <- extract_single_variable(
+  papers_to_extract,
+  prompt_contact,
+  "Contacts_Email"
+)
+
+# Add extractor identifier
+extraction_results$Extractor <- "GPT-5-nano"
+
+message("\n✓ Extraction complete!")
+
+```
+
+
+# ============================================================================
+# PART 6: SAVE RESULTS
+# ============================================================================
+
+```{r save_results, eval=FALSE}
+# Save as RDS
+saveRDS(extraction_results, file.path(OUT_DIR, "nbs_extraction_results_66.rds"))
+
+# Save as CSV
+write_csv(extraction_results, file.path(OUT_DIR, "nbs_extraction_results_66.csv"))
+write_excel_csv(extraction_results, file.path(OUT_DIR, "nbs_extraction_results_econ.csv"))
+
+
+# Save as Excel
+write_xlsx(extraction_results, file.path(OUT_DIR, "nbs_extraction_results.xlsx"))
+
+message(glue("\nResults saved to: {OUT_DIR}"))
+message(glue("  - nbs_extraction_results.rds"))
+message(glue("  - nbs_extraction_results.csv"))
+message(glue("  - nbs_extraction_results.xlsx"))
+
+# ----- Summary statistics -----
+summary_stats <- extraction_results %>%
+  summarise(
+    Total_Papers = n(),
+    NbS_Subpractice_Extracted = sum(!is.na(NbS_Subpractice) & NbS_Subpractice != "NA"),
+    Input_Variables_Extracted = sum(!is.na(Input_Variables) & Input_Variables != "NA"),
+    Spatial_Method_Extracted = sum(!is.na(Spatial_Method) & Spatial_Method != "NA"),
+    Method_Validation_Extracted = sum(!is.na(Method_Validation) & Method_Validation != "NA"),
+    Tool_Extracted = sum(!is.na(Tool) & Tool != "NA"),
+    Output_Extracted = sum(!is.na(Output) & Output != "NA"),
+    Purpose_Extracted = sum(!is.na(Purpose) & Purpose != "NA"),
+    Geographic_Scope_Extracted = sum(!is.na(Geographic_Scope) & Geographic_Scope != "NA"),
+    Narrative_Extracted = sum(!is.na(Narrative) & Narrative != "NA")
+  )
+
+print(summary_stats)
+```
+
+# ============================================================================
+# PART 7: PREVIEW RESULTS
+# ============================================================================
+
+```{r preview, eval=FALSE}
+# Interactive preview
+DT::datatable(
+  extraction_results %>%
+    mutate(across(where(is.character), ~ifelse(
+      nchar(.) > 100,
+      paste0("<span title='", ., "'>", substr(., 1, 100), "...</span>"),
+      .
+    ))),
+  escape = FALSE,
+  options = list(pageLength = 10, scrollX = TRUE),
+  caption = "NbS Stocktake - Extraction Results"
+)
+```
+
+# ============================================================================
+# OPTIONAL: COST ESTIMATION
+# ============================================================================
+
+```{r cost_estimate}
+# Estimate API costs before running full extraction
+estimate_cost <- function(papers_df, n_variables = 12) {
+  
+  # Average text length
+  avg_chars <- mean(nchar(papers_df$Text_For_Extraction), na.rm = TRUE)
+  
+  # Approximate tokens (rough: 4 chars = 1 token)
+  avg_input_tokens <- avg_chars / 4
+  avg_output_tokens <- 200  # Estimated average output
+  
+  n_papers <- nrow(papers_df)
+  total_calls <- n_papers * n_variables
+  
+  # GPT-4o-mini pricing (as of 2024)
+  # Input: $0.15 per 1M tokens
+
+  # Output: $0.60 per 1M tokens
+  
+  input_cost <- (avg_input_tokens * total_calls / 1e6) * 0.15
+  output_cost <- (avg_output_tokens * total_calls / 1e6) * 0.60
+  total_cost <- input_cost + output_cost
+  
+  cat("\n=== COST ESTIMATE ===\n")
+  cat(glue("Papers to process: {n_papers}\n"))
+  cat(glue("Variables per paper: {n_variables}\n"))
+  cat(glue("Total API calls: {total_calls}\n"))
+  cat(glue("Avg input tokens per call: ~{round(avg_input_tokens)}\n"))
+  cat(glue("Estimated cost: ${round(total_cost, 2)}\n"))
+  cat("=====================\n")
+  
+  invisible(total_cost)
+}
+
+# Run cost estimate
+if (exists("papers_to_extract")) {
+  estimate_cost(papers_to_extract)
+}
+```
+
+# ============================================================================
+# OPTIONAL: TEST ON SMALL SAMPLE
+# ============================================================================
+
+```{r test_sample, eval=FALSE}
+# ============================================================================
+# OPTIONAL: TEST ON SMALL SAMPLE (5 papers per NbS Practice, ALL variables)
+# ============================================================================
+set.seed(123)
+
+# Sample up to 5 papers per NbS practice (fixed slice_sample issue)
+test_sample <- papers_to_extract %>%
+  group_by(NbS_Practice) %>%
+  slice_head(n = 5) %>%
+  ungroup() %>%
+  slice_sample(prop = 5)  # Shuffle the result
+
+message(glue("Testing on {nrow(test_sample)} papers across {n_distinct(test_sample$NbS_Practice)} NbS practices..."))
+
+# Check distribution
+test_sample %>% count(NbS_Practice) %>% print()
+
+# Initialize test results dataframe with metadata
+test_results <- test_sample %>%
+  select(
+    File, 
+    NbS_Practice, 
+    NbS_Cluster,
+    Text_For_Extraction
+  )
+
+# ----- Extract ALL variables sequentially -----
+
+# === NbS Subpractice ===
+message("\n=== Extracting NbS Subpractice ===")
+test_results$NbS_Subpractice <- extract_single_variable(
+  test_sample,
+  prompt_nbs_subpractice,
+  "NbS_Subpractice"
+)
+
+# === Input Variables ===
+message("\n=== Extracting Input Variables ===")
+test_results$Input_Variables <- extract_single_variable(
+  test_sample,
+  prompt_input_variables,
+  "Input_Variables"
+)
+
+# Add Input_Variables to test_sample (optional; useful if you later add dependent prompts)
+test_sample$Input_Variables <- test_results$Input_Variables
+
+# === Analysis Resolution ===
+message("\n=== Extracting Analysis Resolution ===")
+test_results$Analysis_Resolution <- extract_single_variable(
+  test_sample,
+  prompt_analysis_resolution,
+  "Analysis_Resolution"
+)
+
+# === Spatial Method ===
+message("\n=== Extracting Spatial Method ===")
+test_results$Spatial_Method <- extract_single_variable(
+  test_sample,
+  prompt_spatial_method,
+  "Spatial_Method"
+)
+
+# Add Spatial_Method to test_sample for dependent prompts
+test_sample$Spatial_Method <- test_results$Spatial_Method
+
+# === Method Validation (depends on Spatial_Method) ===
+message("\n=== Extracting Method Validation ===")
+test_results$Method_Validation <- extract_single_variable(
+  test_sample,
+  prompt_method_validation,
+  "Method_Validation",
+  depends_on = "Spatial_Method"
+)
+
+# === Tool ===
+message("\n=== Extracting Tool ===")
+test_results$Tool <- extract_single_variable(
+  test_sample,
+  prompt_tool,
+  "Tool"
+)
+
+# Add Tool to test_sample for dependent prompts
+test_sample$Tool <- test_results$Tool
+
+# === Tool Source (depends on Tool) ===
+message("\n=== Extracting Tool Source ===")
+test_results$Tool_Source <- extract_single_variable(
+  test_sample,
+  prompt_tool_source,
+  "Tool_Source",
+  depends_on = "Tool"
+)
+
+# === Output (Final geospatial outcomes) ===
+message("\n=== Extracting Output ===")
+test_results$Output <- extract_single_variable(
+  test_sample,
+  prompt_output,
+  "Output"
+)
+
+# Add Output to test_sample (optional)
+test_sample$Output <- test_results$Output
+
+# === Climate: Hazard as Barrier ===
+message("\n=== Extracting Climate Barrier ===")
+test_results$Climate_Barrier <- extract_single_variable(
+  test_sample,
+  prompt_climate_barrier,
+  "Climate_Barrier"
+)
+
+# === Climate: Hazard as Benefit Target (Adaptation/Mitigation) ===
+message("\n=== Extracting Climate Benefit ===")
+test_results$Climate_Benefit <- extract_single_variable(
+  test_sample,
+  prompt_climate_benefit,
+  "Climate_Benefit"
+)
+
+# === Economics ===
+message("\n=== Extracting Economics ===")
+test_results$Economics <- extract_single_variable(
+  test_sample,
+  prompt_economics,
+  "Economics"
+)
+
+# === Geographic Scope ===
+message("\n=== Extracting Geographic Scope ===")
+test_results$Geographic_Scope <- extract_single_variable(
+  test_sample,
+  prompt_geographic_scope,
+  "Geographic_Scope"
+)
+
+# === Narrative ===
+message("\n=== Extracting Narrative ===")
+test_results$Narrative <- extract_single_variable(
+  test_sample,
+  prompt_narrative,
+  "Narrative"
+)
+
+# === Code/Data Availability ===
+message("\n=== Extracting Code Data Availability ===")
+test_results$Code_Data_Availability <- extract_single_variable(
+  test_sample,
+  prompt_code_data_availability,
+  "Code_Data_Availability"
+)
+
+# === Contacts emails (only if you renamed the 2nd prompt_code_data_availability -> prompt_contacts_email) ===
+message("\n=== Extracting Contacts Emails ===")
+test_results$Contacts_Email <- extract_single_variable(
+  test_sample,
+  prompt_contact,
+  "Contacts_Email"
+)
+
+# Add extractor identifier
+test_results$Extractor <- "GPT-5-nano"
+
+message("\n✓ Test extraction complete!")
+
+# ----- Save test results -----
+saveRDS(test_results, file.path(OUT_DIR, "nbs_test_extraction_results4.rds"))
+write_excel_csv(test_results, file.path(OUT_DIR, "nbs_test_extraction_results4.csv"))
+
+message(glue("\nTest results saved to: {OUT_DIR}"))
+
+# ----- Preview test results -----
+DT::datatable(
+ test_results %>%
+    select(-Text_For_Extraction) %>%
+    mutate(across(where(is.character), ~ifelse(
+      nchar(.) > 80,
+      paste0(substr(., 1, 80), "..."),
+      .
+    ))),
+  options = list(pageLength = 10, scrollX = TRUE),
+  caption = glue("Test Extraction Results - {nrow(test_results)} papers ({n_distinct(test_results$NbS_Practice)} NbS Practices)")
+)
+
+# ----- Summary by NbS Practice -----
+test_summary <- test_results %>%
+  group_by(NbS_Practice) %>%
+  summarise(
+    n_papers = n(),
+    input_vars_extracted = sum(!is.na(Input_Variables) & Input_Variables != "NA"),
+    spatial_method_extracted = sum(!is.na(Spatial_Method) & Spatial_Method != "NA"),
+    tool_extracted = sum(!is.na(Tool) & Tool != "NA"),
+    output_extracted = sum(!is.na(Output) & Output != "NA"),
+    .groups = "drop"
+  )
+
+print(test_summary)
+```
+
+
+
