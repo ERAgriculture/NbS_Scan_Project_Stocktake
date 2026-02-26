@@ -28,8 +28,9 @@ library(patchwork)  # install.packages("patchwork") if needed
 # LOAD DATA
 # ============================================================================
 
-harmonized <- read_csv("C:/Users/mlolita/OneDrive - CGIAR/Alliance - ClimateActionNetZero - 1_Projects/D591_Rural-Scan_NBS/2_Technical_&_Data/Stocktake Review/data/NbS_peer_reviewed_harmonized.csv")
-benchmarked <- read_csv("C:/Users/mlolita/OneDrive - CGIAR/Alliance - ClimateActionNetZero - 1_Projects/D591_Rural-Scan_NBS/2_Technical_&_Data/Stocktake Review/data/NbS_peer_reviewed_benchmarked.csv")
+harmonized <- read_csv("C:/Users/JNamita/OneDrive - CGIAR/Alliance - ClimateActionNetZero - Documents/ClimateActionNetZero/1_Projects/D591_Rural-Scan_NBS/2_Technical_&_Data/Stocktake Review/data/NbS_peer_reviewed_harmonized.csv")
+
+benchmarked <- read_csv("C:/Users/JNamita/OneDrive - CGIAR/Alliance - ClimateActionNetZero - Documents/ClimateActionNetZero/1_Projects/D591_Rural-Scan_NBS/2_Technical_&_Data/Stocktake Review/data/NbS_peer_reviewed_benchmarked.csv")
 
 # Short NbS labels for plotting
 nbs_short <- c(
@@ -143,49 +144,157 @@ clean_input <- function(x) {
 
 fig1_data <- explode_col(harmonized, "Spatial_Method_Harmonized") %>%
   mutate(Method = clean_method(Spatial_Method_Harmonized)) %>%
-  filter(!is.na(Method)) %>%
+  filter(!is.na(Method),
+         Method != "Participatory DSS") %>%   # REMOVE participatory DSS
   count(NbS_Short, Method)
 
-# Order NbS by total papers, methods by total frequency
-nbs_order <- harmonized %>% count(NbS_Short) %>% arrange(desc(n)) %>% pull(NbS_Short)
-method_order <- fig1_data %>% count(Method, wt = n) %>% arrange(desc(n)) %>% pull(Method)
+# Recalculate ordering after removal
+nbs_order <- harmonized %>%
+  count(NbS_Short) %>%
+  arrange(desc(n)) %>%
+  pull(NbS_Short)
+
+method_order <- fig1_data %>%
+  count(Method, wt = n) %>%
+  arrange(desc(n)) %>%
+  pull(Method)
 
 fig1 <- ggplot(fig1_data, aes(x = factor(Method, levels = method_order),
                               y = factor(NbS_Short, levels = rev(nbs_order)),
                               fill = n)) +
-  geom_tile(color = "white", linewidth = 0.5) +
-  geom_text(aes(label = n), size = 3, color = "grey20") +
-  scale_fill_distiller(palette = "YlGnBu", direction = 1, name = "Count") +
-  labs(title = "Fig 1. NbS Practice × Spatial Method Category",
-       subtitle = glue("n = {nrow(harmonized)} papers  |  7-category spatial method typology"),
+  geom_tile(color = "white", linewidth = 0.6) +
+  
+  # Dynamic text color for contrast
+  geom_text(aes(label = n,
+                color = n > max(n) * 0.6),   # threshold for dark tiles
+            size = 8, fontface = "bold") +
+  
+  scale_color_manual(values = c("grey15", "white"), guide = "none") +
+  
+  scale_fill_distiller(palette = "YlGnBu",
+                       direction = 1,
+                       name = " Paper Count") +
+  
+  labs(subtitle = glue("n = {nrow(harmonized)} papers  |  6-category spatial method typology"),
        x = NULL, y = NULL) +
+  
   theme_stocktake +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
-        axis.text.y = element_text(size = 9))
+  theme(
+    plot.subtitle = element_text(size = 18),
+    axis.text.x = element_text(size = 18),
+    axis.text.y = element_text(size = 18),
+    legend.title = element_text(size = 15),
+    legend.text = element_text(size = 15)
+  )
+
+# Prevent clipping
+fig1 <- fig1 +
+  coord_cartesian(clip = "off") +
+  theme(
+    plot.margin = margin(t = 15, r = 25, b = 20, l = 60)
+  )
+
+fig1 <- fig1 +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 16)) +
+  theme(
+    axis.text.x = element_text(size = 18),
+    plot.margin = margin(t = 15, r = 25, b = 30, l = 60)
+  )
+
+ggsave(
+  filename = "C:/Users/JNamita/OneDrive - CGIAR/Alliance - ClimateActionNetZero - Documents/ClimateActionNetZero/1_Projects/D591_Rural-Scan_NBS/2_Technical_&_Data/Stocktake Review/figures/fig01_nbs_x_method_heatmap_adjusted.png",
+  plot = fig1,
+  width = 20,
+  height = 8,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
 
 # ============================================================================
 # FIGURE 2: NbS × Input Variable Category Heatmap
 # ============================================================================
 
+# ---- data ----
 fig2_data <- explode_col(harmonized, "Input_Variables_Harmonized") %>%
   mutate(Input = clean_input(Input_Variables_Harmonized)) %>%
   filter(Input != "NA", !is.na(Input)) %>%
   count(NbS_Short, Input)
 
-input_order <- fig2_data %>% count(Input, wt = n) %>% arrange(desc(n)) %>% pull(Input)
+input_order <- fig2_data %>%
+  count(Input, wt = n) %>%
+  arrange(desc(n)) %>%
+  pull(Input)
 
-fig2 <- ggplot(fig2_data, aes(x = factor(Input, levels = input_order),
-                              y = factor(NbS_Short, levels = rev(nbs_order)),
-                              fill = n)) +
-  geom_tile(color = "white", linewidth = 0.5) +
-  geom_text(aes(label = n), size = 2.8, color = "grey20") +
-  scale_fill_distiller(palette = "YlOrRd", direction = 1, name = "Count") +
-  labs(title = "Fig 2. NbS Practice × Input Variable Category",
-       subtitle = "Data dependency patterns across NbS types",
-       x = NULL, y = NULL) +
+# choose a threshold for switching label colour (high counts = darker tiles)
+# Using median is a solid default; you can change to quantile(., 0.6) if needed
+label_thresh <- median(fig2_data$n, na.rm = TRUE)
+
+# ---- compute proper contrast threshold ----
+max_n <- max(fig2_data$n, na.rm = TRUE)
+
+fig2_data <- fig2_data %>%
+  mutate(
+    text_col = ifelse(n >= 0.7 * max_n, "white", "black")  # only darkest tiles white
+  )
+
+# ---- plot ----
+fig2 <- ggplot(
+  fig2_data,
+  aes(
+    x = factor(Input, levels = input_order),
+    y = factor(NbS_Short, levels = rev(nbs_order)),
+    fill = n
+  )
+) +
+  geom_tile(color = "white", linewidth = 0.7) +
+  
+  geom_text(
+    aes(label = n, colour = text_col),
+    size = 8,
+    fontface = "bold"
+  ) +
+  scale_colour_identity() +
+  
+  scale_fill_distiller(
+    palette = "YlOrRd",
+    direction = 1,
+    name = "Paper count"
+  ) +
+  
+  scale_x_discrete(
+    labels = function(x) str_wrap(x, width = 14)
+  ) +
+  
+  labs(
+    subtitle = "Data dependency patterns across NbS types",
+    x = NULL,
+    y = NULL
+  ) +
+  
   theme_stocktake +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7.5),
-        axis.text.y = element_text(size = 9))
+  theme(
+    plot.subtitle = element_text(size = 18, face = "bold"),
+    
+    axis.text.x = element_text(size = 13, angle = 0, hjust = 0.5),
+    axis.text.y = element_text(size = 16),
+    legend.text = element_text(size = 14),
+    legend.key.height = unit(0.6, "cm"),
+    legend.key.width  = unit(2.5, "cm"),
+    legend.position = "bottom",
+    
+    plot.margin = margin(t = 15, r = 20, b = 20, l = 60)
+  )
+
+ggsave(
+  filename = "C:/Users/JNamita/OneDrive - CGIAR/Alliance - ClimateActionNetZero - Documents/ClimateActionNetZero/1_Projects/D591_Rural-Scan_NBS/2_Technical_&_Data/Stocktake Review/figures/fig02_nbs_x_input_heatmap_adjusted.png",
+  plot = fig2,
+  width = 20,     # wider (many input categories)
+  height = 9,     # slightly taller for wrapped labels
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
 
 # ============================================================================
 # FIGURE 3: Benchmark Flag by NbS (stacked bar)
@@ -308,31 +417,70 @@ fig7 <- ggplot(fig7_data, aes(x = Dimension,
 fig8_data <- benchmarked %>%
   filter(!is.na(Scalability_Score), Scalability_Score != "NA",
          !is.na(Quality_Score), Quality_Score != "NA") %>%
-  mutate(Scalability_Score = as.integer(Scalability_Score),
-         Quality_Score = as.integer(Quality_Score)) %>%
+  mutate(
+    Scalability_Score = as.integer(Scalability_Score),
+    Quality_Score     = as.integer(Quality_Score)
+  ) %>%
   count(Scalability_Score, Quality_Score) %>%
-  mutate(Benchmark = case_when(
-    Scalability_Score == 1 | Quality_Score == 1 ~ "Low",
-    Scalability_Score == 2 & Quality_Score == 2 ~ "Medium",
-    TRUE ~ "High"
-  ))
+  mutate(
+    # ✅ Benchmark logic (more intuitive “maturity” framing)
+    # High only when BOTH are high (3×3)
+    Benchmark = case_when(
+      Scalability_Score == 3 & Quality_Score == 3 ~ "High",
+      Scalability_Score == 1 | Quality_Score == 1 ~ "Low",
+      TRUE ~ "Medium"
+    ),
+    # ✅ text colour per benchmark (matches tile meaning)
+    TextCol = case_when(
+      Benchmark == "High"   ~ "#2d6a4f",
+      Benchmark == "Medium" ~ "#c9a227",
+      TRUE                  ~ "#993333"
+    )
+  )
 
-fig8 <- ggplot(fig8_data, aes(x = factor(Quality_Score),
-                              y = factor(Scalability_Score),
-                              fill = Benchmark)) +
+fig8 <- ggplot(
+  fig8_data,
+  aes(
+    x    = factor(Quality_Score),
+    y    = factor(Scalability_Score),
+    fill = Benchmark
+  )
+) +
   geom_tile(color = "white", linewidth = 1.5, alpha = 0.3) +
-  geom_text(aes(label = n), size = 7, fontface = "bold",
-            color = ifelse(fig8_data$Benchmark == "High", "#2d6a4f",
-                           ifelse(fig8_data$Benchmark == "Medium", "#c9a227", "#993333"))) +
-  geom_text(aes(label = Benchmark), vjust = 2.5, size = 3,
-            color = ifelse(fig8_data$Benchmark == "High", "#2d6a4f",
-                           ifelse(fig8_data$Benchmark == "Medium", "#c9a227", "#993333"))) +
+  geom_text(aes(label = n), size = 8, fontface = "bold", color = fig8_data$TextCol) +
+  geom_text(aes(label = Benchmark), vjust = 2.5, size = 6, color = fig8_data$TextCol) +
   scale_fill_manual(values = bench_cols, guide = "none") +
-  labs(title = "Fig 8. Scalability × Quality Cross-table",
-       subtitle = glue("n = {sum(fig8_data$n)} scored papers"),
-       x = "Evidence Quality Score", y = "Scalability Score") +
+  labs(
+    subtitle = glue("n = {sum(fig8_data$n)} scored papers"),
+    x        = "Evidence Quality Score",
+    y        = "Scalability Score"
+  ) +
   theme_stocktake +
-  theme(panel.grid = element_blank())
+  theme(
+    panel.grid = element_blank(),
+    
+    # Make titles larger
+    plot.title = element_text(size = 22, face = "bold"),
+    plot.subtitle = element_text(size = 16),
+    
+    # Axis titles
+    axis.title.x = element_text(size = 18, margin = margin(t = 10)),
+    axis.title.y = element_text(size = 18, margin = margin(r = 10)),
+    
+    # Axis tick labels (1,2,3)
+    axis.text.x = element_text(size = 16),
+    axis.text.y = element_text(size = 16)
+  )
+
+ggsave(
+  filename = "C:/Users/JNamita/OneDrive - CGIAR/Alliance - ClimateActionNetZero - Documents/ClimateActionNetZero/1_Projects/D591_Rural-Scan_NBS/2_Technical_&_Data/Stocktake Review/figures/fig08_scalability_quality_cross_adjusted.png",
+  plot = fig8,
+  width = 10,
+  height = 9,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
 
 # ============================================================================
 # FIGURE 9: Validation Methods (horizontal bar)
@@ -383,24 +531,79 @@ fig10 <- ggplot(fig10_data, aes(x = fct_reorder(Resolution, n), y = n)) +
 # FIGURE 11: NbS × Output Type Heatmap
 # ============================================================================
 
+# Remove last 3 output types (adjust names if needed)
+drop_outputs <- c(
+  "Conservation network / selection solutions",
+  "Conservation network / selection solutions: Spatial optimization outputs",
+  "Scenarios comparisons"
+)
+
 fig11_data <- explode_col(harmonized, "Output_Harmonized") %>%
   filter(Output_Harmonized != "NA", !is.na(Output_Harmonized)) %>%
-  count(NbS_Short, Output_Harmonized)
+  filter(!Output_Harmonized %in% drop_outputs) %>%
+  count(NbS_Short, Output_Harmonized, name = "n")
 
-output_order <- fig11_data %>% count(Output_Harmonized, wt = n) %>% arrange(desc(n)) %>% pull(Output_Harmonized)
+output_order <- fig11_data %>%
+  count(Output_Harmonized, wt = n) %>%
+  arrange(desc(n)) %>%
+  pull(Output_Harmonized)
 
-fig11 <- ggplot(fig11_data, aes(x = factor(Output_Harmonized, levels = output_order),
-                                y = factor(NbS_Short, levels = rev(nbs_order)),
-                                fill = n)) +
-  geom_tile(color = "white", linewidth = 0.5) +
-  geom_text(aes(label = n), size = 3, color = "grey20") +
-  scale_fill_distiller(palette = "BuPu", direction = 1, name = "Count") +
-  labs(title = "Fig 11. NbS Practice × Output Type",
-       subtitle = "Types of geospatial outputs produced by NbS practice",
-       x = NULL, y = NULL) +
+# Contrast threshold
+max_n <- max(fig11_data$n, na.rm = TRUE)
+
+fig11_data <- fig11_data %>%
+  mutate(text_col = ifelse(n >= 0.7 * max_n, "white", "black"))
+
+fig11 <- ggplot(
+  fig11_data,
+  aes(
+    x = factor(Output_Harmonized, levels = output_order),
+    y = factor(NbS_Short, levels = rev(nbs_order)),
+    fill = n
+  )
+) +
+  geom_tile(color = "white", linewidth = 0.7) +
+  geom_text(
+    aes(label = n, colour = text_col),
+    size = 6,
+    fontface = "bold"
+  ) +
+  scale_colour_identity() +
+  scale_fill_distiller(
+    palette = "BuPu",
+    direction = 1,
+    name = "Paper count"
+  ) +
+  scale_x_discrete(
+    labels = function(x) str_wrap(x, width = 18)
+  ) +
+  labs(
+    subtitle = "Types of geospatial outputs produced by NbS practice",
+    x = NULL, y = NULL
+  ) +
   theme_stocktake +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
-        axis.text.y = element_text(size = 9))
+  theme(
+    plot.subtitle = element_text(size = 18, face = "bold"),
+    axis.text.x = element_text(size = 14, angle = 0, hjust = 0.5),
+    axis.text.y = element_text(size = 18),
+    legend.text = element_text(size = 14),
+    legend.key.height = unit(0.6, "cm"),
+    legend.key.width  = unit(2.5, "cm"),
+    legend.position = "bottom",
+    plot.margin = margin(t = 15, r = 20, b = 20, l = 60)
+  )
+
+# Save directly (same style as previous figures)
+ggsave(
+  filename = "C:/Users/JNamita/OneDrive - CGIAR/Alliance - ClimateActionNetZero - Documents/ClimateActionNetZero/1_Projects/D591_Rural-Scan_NBS/2_Technical_&_Data/Stocktake Review/figures/fig11_nbs_x_output_heatmap_adjusted3.png",
+  plot = fig11,
+  width = 18,
+  height = 8,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
+
 
 # ============================================================================
 # DISPLAY ALL FIGURES
